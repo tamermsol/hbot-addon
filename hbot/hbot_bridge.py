@@ -38,8 +38,13 @@ AUTODISCOVER = os.environ.get("HBOT_AUTODISCOVER", "true").lower() not in ("fals
 SCAN_SUBNETS = [s.strip() for s in os.environ.get("HBOT_SUBNETS", "").split(",") if s.strip()]
 
 HTTP_TIMEOUT = 5
-PROBE_TIMEOUT = 1.5  # short per-host timeout for the subnet sweep
-SCAN_WORKERS = 64
+# (connect, read) timeouts for the sweep. A short CONNECT timeout is what keeps a /24 sweep fast
+# even when many hosts silently drop SYNs (firewalled) instead of refusing — those would otherwise
+# each block for the full timeout and make the sweep take ~20s.
+PROBE_CONNECT_TIMEOUT = 0.6
+PROBE_READ_TIMEOUT = 1.5
+SCAN_WORKERS = 128
+DEBUG = os.environ.get("HBOT_DEBUG", "false").lower() in ("true", "1", "yes")
 
 
 def log(*a):
@@ -48,27 +53,50 @@ def log(*a):
 
 # ── auto-discovery ──────────────────────────────────────────────────────────
 def _looks_like_hbot(status):
-    """True if a `Status 0` JSON reply looks like an HBot/Tasmota device."""
+    """True if a `Status 0` JSON reply looks like an HBot/Tasmota device.
+
+    A Tasmota `Status 0` reply always has a top-level "Status" object with a non-empty "Topic".
+    That alone is a reliable Tasmota signature (nothing else answers /cm with this shape), so we
+    accept on Topic + any of the usual Tasmota keys — kept lenient so an unusual firmware build
+    isn't wrongly rejected."""
     if not isinstance(status, dict):
         return False
-    # Tasmota Status 0 always carries a "Status" block with a Topic; HBot topics start "hbot"/"Hbot".
     st = status.get("Status")
     if not isinstance(st, dict):
         return False
     topic = str(st.get("Topic") or "")
-    # Accept any Tasmota device (has Topic + FriendlyName), and prefer HBot-named topics.
-    return bool(topic) and ("FriendlyName" in st or "Module" in st)
+    if not topic:
+        return False
+    return any(k in st for k in ("FriendlyName", "Module", "DeviceName", "Power"))
 
 
 def _probe_ip(ip):
-    """Cheap reachability + identity probe for the subnet sweep. Returns ip if it's an HBot, else None."""
+    """Cheap reachability + identity probe for the subnet sweep. Returns ip if it's an HBot, else None.
+
+    In HBOT_DEBUG mode, logs every host that answers on :80 and why it was accepted/rejected —
+    use it to find where your device actually is when discovery comes up empty."""
     url = f"http://{ip}/cm?cmnd={quote('Status 0', safe='')}"
     try:
-        r = requests.get(url, timeout=PROBE_TIMEOUT)
-        if r.status_code == 200 and _looks_like_hbot(r.json()):
-            return ip
-    except Exception:
-        pass
+        r = requests.get(url, timeout=(PROBE_CONNECT_TIMEOUT, PROBE_READ_TIMEOUT))
+        if r.status_code == 200:
+            try:
+                body = r.json()
+            except Exception:
+                if DEBUG:
+                    log(f"  {ip}:80 answered but not JSON (not an HBot): {r.text[:80]!r}")
+                return None
+            if _looks_like_hbot(body):
+                return ip
+            if DEBUG:
+                log(f"  {ip}:80 answered JSON but not an HBot Status 0 reply")
+        elif DEBUG:
+            log(f"  {ip}:80 HTTP {r.status_code} (not an HBot)")
+    except Exception as e:
+        if DEBUG:
+            # Only interesting when the host actually refused/exists — skip pure timeouts.
+            msg = str(e)
+            if "refused" in msg.lower() or "reset" in msg.lower():
+                log(f"  {ip}:80 up but refused/reset (not serving HTTP)")
     return None
 
 
@@ -245,37 +273,55 @@ def discover_subnet():
             hosts.extend(str(h) for h in net.hosts())
     if not hosts:
         return set()
-    log(f"sweeping {len(hosts)} host(s) for HBot devices …")
+    log(f"sweeping {len(hosts)} host(s) for HBot devices "
+        f"(set HBOT_DEBUG=true in options to see per-host results) …")
     found = set()
     with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
         for ip in ex.map(_probe_ip, hosts):
             if ip:
                 found.add(ip)
+    if not found:
+        log("sweep finished: no HBot device answered Status 0 on port 80 in this subnet. "
+            "If your device is here, check it's powered on and its web UI opens at http://<its-ip>/ ; "
+            "otherwise set 'subnets' to the device's network or add its IP under 'devices'.")
     return found
 
 
 def discover_devices():
-    """Merge manual IPs + mDNS + subnet sweep into the full IP set to bridge.
+    """Return IPs that are CONFIRMED HBot devices, plus any manually-listed IPs.
 
-    Wrapped so a failure in either discovery method can never crash the add-on — it just
-    returns whatever it has (at least the manual IPs)."""
-    ips = set(MANUAL_DEVICES)
+    Every auto-discovered candidate (mDNS OR subnet sweep) is verified with `_probe_ip` before
+    it's returned, so non-HBot hosts on your LAN — printers, NAS, phones that also answer/advertise
+    HTTP — are dropped silently here instead of producing scary 'Connection refused' logs later.
+    Manually-listed IPs are always included (they may be a real HBot that's briefly offline).
+
+    Wrapped so a failure in either method can never crash the add-on."""
+    confirmed = set(MANUAL_DEVICES)  # manual IPs are trusted; they retry if offline
     if AUTODISCOVER:
+        candidates = set()
         try:
             m = discover_mdns()
             if m:
-                log(f"mDNS found: {sorted(m)}")
-            ips |= m
+                log(f"mDNS advertised {len(m)} HTTP host(s); verifying which are HBot …")
+            candidates |= m
         except Exception as e:
             log(f"mDNS discovery error (continuing): {e}")
         try:
-            s = discover_subnet()
-            if s:
-                log(f"subnet sweep found: {sorted(s)}")
-            ips |= s
+            # The subnet sweep already returns only verified HBot IPs — take them as-is.
+            confirmed |= discover_subnet()
         except Exception as e:
             log(f"subnet sweep error (continuing): {e}")
-    return sorted(ips)
+        # Verify mDNS candidates (minus ones the sweep already confirmed) so non-HBot hosts drop out.
+        to_check = [ip for ip in candidates if ip not in confirmed]
+        if to_check:
+            with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
+                for ip in ex.map(_probe_ip, to_check):
+                    if ip:
+                        confirmed.add(ip)
+    found = sorted(confirmed)
+    if found:
+        log(f"confirmed HBot device(s): {found}")
+    return found
 
 
 def tasmota(ip, cmnd):

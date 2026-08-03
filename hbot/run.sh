@@ -7,16 +7,21 @@ SUBNETS=$(bashio::config 'subnets | join(",")')
 AUTODISCOVER=$(bashio::config 'autodiscover')
 POLL=$(bashio::config 'poll_interval')
 PREFIX=$(bashio::config 'discovery_prefix')
+DEBUG=$(bashio::config 'debug')
 
 # HA's built-in MQTT broker credentials (provided because we declared services: mqtt:need).
+# Do NOT `exit 1` if MQTT isn't ready yet — that made the Supervisor restart-loop us and the add-on
+# looked like it 'stopped after ~20s'. Fall back to the default broker host and let the Python side
+# retry the connection forever instead.
 if bashio::services.available "mqtt"; then
   export MQTT_HOST="$(bashio::services mqtt 'host')"
   export MQTT_PORT="$(bashio::services mqtt 'port')"
   export MQTT_USER="$(bashio::services mqtt 'username')"
   export MQTT_PASS="$(bashio::services mqtt 'password')"
 else
-  bashio::log.fatal "No MQTT service available. Install the 'Mosquitto broker' add-on and try again."
-  exit 1
+  bashio::log.warning "MQTT service not reported yet — falling back to core-mosquitto:1883 and retrying."
+  export MQTT_HOST="core-mosquitto"
+  export MQTT_PORT="1883"
 fi
 
 export HBOT_DEVICES="$DEVICES"
@@ -24,6 +29,8 @@ export HBOT_SUBNETS="$SUBNETS"
 export HBOT_AUTODISCOVER="$AUTODISCOVER"
 export HBOT_POLL="$POLL"
 export HBOT_PREFIX="$PREFIX"
+export HBOT_DEBUG="$DEBUG"
 
-bashio::log.info "HBot starting — autodiscover: ${AUTODISCOVER}, manual devices: ${DEVICES:-none}, subnets: ${SUBNETS:-auto}, MQTT: ${MQTT_HOST}:${MQTT_PORT}, poll ${POLL}s"
+bashio::log.info "HBot starting — autodiscover: ${AUTODISCOVER}, manual devices: ${DEVICES:-none}, subnets: ${SUBNETS:-auto}, debug: ${DEBUG}, MQTT: ${MQTT_HOST}:${MQTT_PORT}, poll ${POLL}s"
+# `exec` so signals reach python; if python ever exits, the trap logs it (should never happen).
 exec python3 /hbot_bridge.py
