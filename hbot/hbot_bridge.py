@@ -582,6 +582,9 @@ class Bridge:
                     "command_topic": cmd_topic,
                     "state_topic": f"hbot/{base}/{i}/state",
                     "payload_on": "ON", "payload_off": "OFF",
+                    # Never let HA render an optimistic guess — it waits for the state topic, which the
+                    # command relay now publishes immediately. Together these stop the toggle bounce.
+                    "optimistic": False, "qos": 1,
                     "device": dev_block,
                 }), qos=1, retain=True)
                 self.cmd_map[cmd_topic] = (d.ip, "power", i)
@@ -598,8 +601,24 @@ class Bridge:
         ip, kind, idx = entry
         payload = msg.payload.decode(errors="ignore").strip()
         log(f"command {msg.topic} = {payload} → {ip} ({kind}{idx})")
+        d = self.devices.get(ip)
+        base = d.topic if d else None
         if kind == "power":
-            tasmota(ip, f"POWER{idx} {payload}")  # ON / OFF
+            # Tasmota's /cm reply to a POWER command echoes the resulting relay state as
+            # {"POWERn":"ON"} — publish it straight back to the state topic so HA confirms the
+            # toggle IMMEDIATELY. Without this, HA had only the STALE retained state until the next
+            # ~POLL-second poll, so the dashboard toggle flipped back then settled (the on→off→on
+            # bounce). Republishing on-command removes that gap entirely.
+            res = tasmota(ip, f"POWER{idx} {payload}")  # ON / OFF
+            if base:
+                val = None
+                if isinstance(res, dict):
+                    val = res.get(f"POWER{idx}") or (res.get("POWER") if (d and d.channels == 1) else None)
+                # Fall back to the requested payload if the device didn't echo a parseable state.
+                if val not in ("ON", "OFF"):
+                    val = payload.upper() if payload.upper() in ("ON", "OFF") else None
+                if val in ("ON", "OFF"):
+                    self.client.publish(f"hbot/{base}/{idx}/state", val, retain=True)
         elif kind == "cover":
             cmd = {"OPEN": "ShutterOpen1", "CLOSE": "ShutterClose1", "STOP": "ShutterStop1"}.get(payload.upper())
             if cmd:
