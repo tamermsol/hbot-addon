@@ -8,6 +8,8 @@ AUTODISCOVER=$(bashio::config 'autodiscover')
 POLL=$(bashio::config 'poll_interval')
 PREFIX=$(bashio::config 'discovery_prefix')
 DEBUG=$(bashio::config 'debug')
+ACCOUNT_EMAIL=$(bashio::config 'account_email')
+ACCOUNT_PASSWORD=$(bashio::config 'account_password')
 
 # HA's built-in MQTT broker credentials (provided because we declared services: mqtt:need).
 # Do NOT `exit 1` if MQTT isn't ready yet — that made the Supervisor restart-loop us and the add-on
@@ -30,7 +32,9 @@ export HBOT_AUTODISCOVER="$AUTODISCOVER"
 export HBOT_POLL="$POLL"
 export HBOT_PREFIX="$PREFIX"
 export HBOT_DEBUG="$DEBUG"
+export HBOT_ACCOUNT_EMAIL="$ACCOUNT_EMAIL"
+export HBOT_ACCOUNT_PASSWORD="$ACCOUNT_PASSWORD"
 
-bashio::log.info "HBot starting — autodiscover: ${AUTODISCOVER}, manual devices: ${DEVICES:-none}, subnets: ${SUBNETS:-auto}, debug: ${DEBUG}, MQTT: ${MQTT_HOST}:${MQTT_PORT}, poll ${POLL}s"
+bashio::log.info "HBot starting — account: ${ACCOUNT_EMAIL:-none}, autodiscover: ${AUTODISCOVER}, manual devices: ${DEVICES:-none}, subnets: ${SUBNETS:-auto}, debug: ${DEBUG}, MQTT: ${MQTT_HOST}:${MQTT_PORT}, poll ${POLL}s"
 # `exec` so signals reach python; if python ever exits, the trap logs it (should never happen).
 exec python3 /hbot_bridge.py

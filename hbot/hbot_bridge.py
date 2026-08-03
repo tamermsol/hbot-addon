@@ -46,19 +46,150 @@ PROBE_READ_TIMEOUT = 1.5
 SCAN_WORKERS = 128
 DEBUG = os.environ.get("HBOT_DEBUG", "false").lower() in ("true", "1", "yes")
 
+# ── account scoping (Option 2) ──
+# When the operator's H-Bot account is configured, discovery is restricted to devices REGISTERED
+# to that account: we sign in to Supabase and pull the allow-list of topic_base + mac_address
+# (owner_user_id = the account's uid), then only bridge LAN devices whose Status 0 topic/MAC matches.
+SUPABASE_URL = os.environ.get("HBOT_SUPABASE_URL", "https://mvmvqycvorstsftcldzs.supabase.co").rstrip("/")
+SUPABASE_ANON = os.environ.get(
+    "HBOT_SUPABASE_ANON",
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im12bXZxeWN2b3JzdHNmdGNsZHpzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTUwMDczNTQsImV4cCI6MjA3MDU4MzM1NH0.gA744wsXronSyRXHCS60DVcVqJ3_y0MgkqEhLsFxYDI",
+)
+ACCOUNT_EMAIL = os.environ.get("HBOT_ACCOUNT_EMAIL", "").strip()
+ACCOUNT_PASSWORD = os.environ.get("HBOT_ACCOUNT_PASSWORD", "")
+# Populated by fetch_account_allowlist(): sets of normalised topics + MACs owned by the account.
+# None = no account configured (fall back to name-based 'hbot' matching); a set (even empty) = enforce.
+ACCOUNT_TOPICS = None
+ACCOUNT_MACS = None
+
 
 def log(*a):
     print("[hbot]", *a, flush=True)
 
 
+# ── account scoping (Option 2) ──────────────────────────────────────────────
+def _norm_mac(mac):
+    """Normalise a MAC to lowercase hex with no separators, for reliable comparison."""
+    return "".join(c for c in str(mac or "").lower() if c in "0123456789abcdef")
+
+
+def _norm_topic(t):
+    return str(t or "").strip().lower()
+
+
+def fetch_account_allowlist():
+    """Sign in to Supabase with the operator's H-Bot account and load the set of devices that
+    belong to it (owner_user_id = the account uid). Populates ACCOUNT_TOPICS / ACCOUNT_MACS.
+
+    Sets both to None if no account is configured (→ fall back to name-based matching). On auth or
+    query failure it logs and leaves them None so discovery still works (name-based) rather than
+    silently bridging nothing."""
+    global ACCOUNT_TOPICS, ACCOUNT_MACS
+    if not (ACCOUNT_EMAIL and ACCOUNT_PASSWORD):
+        ACCOUNT_TOPICS = ACCOUNT_MACS = None
+        return
+    try:
+        # 1) password sign-in → access token + user id
+        r = requests.post(
+            f"{SUPABASE_URL}/auth/v1/token?grant_type=password",
+            headers={"apikey": SUPABASE_ANON, "Content-Type": "application/json"},
+            json={"email": ACCOUNT_EMAIL, "password": ACCOUNT_PASSWORD},
+            timeout=HTTP_TIMEOUT,
+        )
+        if r.status_code != 200:
+            log(f"account sign-in failed (HTTP {r.status_code}: {r.text[:120]}). "
+                f"Check account_email/account_password. Falling back to name-based discovery.")
+            ACCOUNT_TOPICS = ACCOUNT_MACS = None
+            return
+        auth = r.json()
+        token = auth.get("access_token")
+        uid = (auth.get("user") or {}).get("id")
+        if not token or not uid:
+            log("account sign-in returned no token/uid; falling back to name-based discovery.")
+            ACCOUNT_TOPICS = ACCOUNT_MACS = None
+            return
+        # 2) devices owned by this account → topic_base + mac_address allow-list
+        dr = requests.get(
+            f"{SUPABASE_URL}/rest/v1/devices",
+            headers={"apikey": SUPABASE_ANON, "Authorization": f"Bearer {token}"},
+            params={
+                "owner_user_id": f"eq.{uid}",
+                "is_deleted": "eq.false",
+                "select": "topic_base,mac_address,display_name",
+            },
+            timeout=HTTP_TIMEOUT,
+        )
+        if dr.status_code != 200:
+            log(f"account device query failed (HTTP {dr.status_code}: {dr.text[:120]}); "
+                f"falling back to name-based discovery.")
+            ACCOUNT_TOPICS = ACCOUNT_MACS = None
+            return
+        rows = dr.json() or []
+        ACCOUNT_TOPICS = {_norm_topic(d.get("topic_base")) for d in rows if d.get("topic_base")}
+        ACCOUNT_MACS = {_norm_mac(d.get("mac_address")) for d in rows if d.get("mac_address")}
+        log(f"account '{ACCOUNT_EMAIL}': {len(rows)} registered device(s) "
+            f"({len(ACCOUNT_TOPICS)} topics, {len(ACCOUNT_MACS)} MACs) — discovery scoped to these.")
+        if DEBUG:
+            log(f"  account topics={sorted(ACCOUNT_TOPICS)} macs={sorted(ACCOUNT_MACS)}")
+    except Exception as e:
+        log(f"account allow-list error ({e}); falling back to name-based discovery.")
+        ACCOUNT_TOPICS = ACCOUNT_MACS = None
+
+
+def _account_configured():
+    """True once fetch_account_allowlist has an allow-list to enforce (account sign-in succeeded)."""
+    return ACCOUNT_TOPICS is not None or ACCOUNT_MACS is not None
+
+
+def status_net_mac(status):
+    """Tasmota reports the MAC in the top-level StatusNET.Mac block of a `Status 0` reply."""
+    net = (status or {}).get("StatusNET") or {}
+    return net.get("Mac") or ""
+
+
+def _in_account(status):
+    """True if this device's Status 0 identity (topic or MAC) is in the account allow-list.
+
+    `status` is the FULL Status 0 reply (topic lives in status['Status'], MAC in status['StatusNET'])."""
+    st = (status or {}).get("Status") or {}
+    topic = _norm_topic(st.get("Topic"))
+    if topic and ACCOUNT_TOPICS and topic in ACCOUNT_TOPICS:
+        return True
+    mac = _norm_mac(status_net_mac(status))
+    if mac and ACCOUNT_MACS and mac in ACCOUNT_MACS:
+        return True
+    return False
+
+
 # ── auto-discovery ──────────────────────────────────────────────────────────
+# HBot devices identify themselves by name/topic starting with "hbot" (e.g. Hbot_2CH_ABC123,
+# Hbot_shutter_ABC123, hbot_F24188). We match on that so discovery picks the operator's H-Bot
+# devices specifically and ignores unrelated Tasmota gear on the same LAN. Set HBOT_MATCH_ANY=true
+# to fall back to accepting ANY Tasmota device (the old lenient behaviour) if a device is named
+# oddly and isn't being found.
+MATCH_ANY_TASMOTA = os.environ.get("HBOT_MATCH_ANY", "false").lower() in ("true", "1", "yes")
+
+
+def _is_hbot_named(st):
+    """True if any of the device's identity fields start with 'hbot' (case-insensitive)."""
+    fields = [st.get("Topic"), st.get("DeviceName"), st.get("Hostname")]
+    fn = st.get("FriendlyName")
+    if isinstance(fn, list):
+        fields.extend(fn)
+    elif fn:
+        fields.append(fn)
+    return any(str(v).strip().lower().startswith("hbot") for v in fields if v)
+
+
 def _looks_like_hbot(status):
-    """True if a `Status 0` JSON reply looks like an HBot/Tasmota device.
+    """True if a `Status 0` JSON reply is a device we should bridge.
 
     A Tasmota `Status 0` reply always has a top-level "Status" object with a non-empty "Topic".
-    That alone is a reliable Tasmota signature (nothing else answers /cm with this shape), so we
-    accept on Topic + any of the usual Tasmota keys — kept lenient so an unusual firmware build
-    isn't wrongly rejected."""
+    Selection rule, in order:
+      • account configured  → accept ONLY devices in the account allow-list (topic OR MAC match)
+                               [Option 2 — devices registered to the operator's H-Bot account];
+      • HBOT_MATCH_ANY=true → accept any Tasmota device;
+      • otherwise           → accept HBot-NAMED devices (topic/name starts with 'hbot')."""
     if not isinstance(status, dict):
         return False
     st = status.get("Status")
@@ -67,7 +198,14 @@ def _looks_like_hbot(status):
     topic = str(st.get("Topic") or "")
     if not topic:
         return False
-    return any(k in st for k in ("FriendlyName", "Module", "DeviceName", "Power"))
+    is_tasmota = any(k in st for k in ("FriendlyName", "Module", "DeviceName", "Power"))
+    if not is_tasmota:
+        return False
+    if _account_configured():
+        return _in_account(status)          # strict: only this account's registered devices
+    if MATCH_ANY_TASMOTA:
+        return True
+    return _is_hbot_named(st)
 
 
 def _probe_ip(ip):
@@ -88,7 +226,15 @@ def _probe_ip(ip):
             if _looks_like_hbot(body):
                 return ip
             if DEBUG:
-                log(f"  {ip}:80 answered JSON but not an HBot Status 0 reply")
+                st = (body.get("Status") or {}) if isinstance(body, dict) else {}
+                tp = st.get("Topic")
+                if tp and _account_configured():
+                    log(f"  {ip}:80 is Tasmota (topic={tp}, mac={status_net_mac(body)}) "
+                        f"but NOT registered to this account — skipped")
+                elif tp:
+                    log(f"  {ip}:80 is Tasmota (topic={tp}) but name doesn't start with 'hbot' — skipped")
+                else:
+                    log(f"  {ip}:80 answered JSON but not a Tasmota Status 0 reply")
         elif DEBUG:
             log(f"  {ip}:80 HTTP {r.status_code} (not an HBot)")
     except Exception as e:
@@ -504,7 +650,11 @@ class Bridge:
 
     def run(self):
         log(f"config: manual={MANUAL_DEVICES} autodiscover={AUTODISCOVER} "
-            f"subnets={SCAN_SUBNETS or 'auto'} mqtt={MQTT_HOST}:{MQTT_PORT} prefix={PREFIX} poll={POLL}s")
+            f"subnets={SCAN_SUBNETS or 'auto'} account={ACCOUNT_EMAIL or 'none'} "
+            f"mqtt={MQTT_HOST}:{MQTT_PORT} prefix={PREFIX} poll={POLL}s")
+
+        # If an H-Bot account is configured, sign in and scope discovery to devices registered to it.
+        fetch_account_allowlist()
 
         # Discover the device IPs (manual + mDNS + subnet sweep) before announcing.
         log("discovering HBot devices on the LAN …")
