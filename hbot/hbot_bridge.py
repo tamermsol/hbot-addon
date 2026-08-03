@@ -72,24 +72,120 @@ def _probe_ip(ip):
     return None
 
 
-def _local_subnets():
-    """Derive candidate /24 subnets from the host's own IPv4 addresses."""
-    subnets = []
+# Docker/container bridge ranges that never host real devices. Tasmota devices live on the
+# home LAN — almost always 192.168.x or 10.x — so we DESELECT the 172.16/12 docker space and
+# only fall back to it if nothing better is found.
+_DOCKER_NETS = [ipaddress.ip_network(n) for n in ("172.16.0.0/12",)]
+
+
+def _is_lan_ipv4(ip):
+    """True for a private LAN IPv4 we should sweep — excludes loopback and link-local."""
     try:
-        # UDP connect doesn't send packets but picks the primary outbound interface IP.
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return a.version == 4 and a.is_private and not a.is_loopback and not a.is_link_local
+
+
+def _is_dockerish(ip):
+    """True if the IP is in the Docker/HA-supervisor bridge space (172.16/12) — likely NOT the LAN."""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return True
+    return any(a in n for n in _DOCKER_NETS)
+
+
+def _all_host_ipv4s():
+    """Every IPv4 the container/host has, across ALL interfaces (not just the default route).
+
+    In a HA add-on the default-route interface is usually the internal Docker net, so the old
+    connect-to-8.8.8.8 trick derived the WRONG subnet and the sweep found nothing. Read the real
+    interface addresses from /proc/net/fib_trie (works even without `ip`/`ifconfig` in the image),
+    with getaddrinfo(hostname) as a fallback.
+    """
+    ips = set()
+    # 1) /proc/net/fib_trie lists every locally-configured address (the /32 "host" leaves).
+    try:
+        with open("/proc/net/fib_trie") as f:
+            lines = f.read().splitlines()
+        for i, ln in enumerate(lines):
+            ln = ln.strip()
+            if ln.startswith("|--") and i + 1 < len(lines) and "host LOCAL" in lines[i + 1]:
+                ips.add(ln.split("|--")[1].strip())
+    except Exception:
+        pass
+    # 2) fallback: resolve our own hostname.
+    try:
+        for res in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.add(res[4][0])
+    except Exception:
+        pass
+    # 3) last-ditch: default-route IP (may be the docker net, filtered out below if so).
+    try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
-        host_ip = s.getsockname()[0]
+        ips.add(s.getsockname()[0])
         s.close()
-        net = ipaddress.ip_network(f"{host_ip}/24", strict=False)
-        subnets.append(str(net))
-    except Exception as e:
-        log(f"could not derive local subnet: {e}")
-    return subnets
+    except Exception:
+        pass
+    return ips
+
+
+def _default_route_ip():
+    """IP of the interface that reaches the internet/LAN gateway. With host_network:true this is
+    the host's real LAN interface — the single most reliable signal for where devices are."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return None
+
+
+def _local_subnets():
+    """Derive /24 subnet(s) to sweep, PREFERRING the real LAN over Docker bridges.
+
+    Order of preference so we sweep the right net first (and usually only it):
+      1. the default-route interface's /24 (the LAN when host_network:true),
+      2. any other non-docker private /24 (192.168.x, 10.x),
+      3. docker-ish 172.16/12 /24s only as a last resort.
+    """
+    all_ips = _all_host_ipv4s()
+    lan_ips = [ip for ip in all_ips if _is_lan_ipv4(ip)]
+
+    ordered = []
+    dr = _default_route_ip()
+    if dr and _is_lan_ipv4(dr):
+        ordered.append(dr)                                   # 1) default-route LAN IP first
+    ordered += [ip for ip in sorted(lan_ips) if not _is_dockerish(ip) and ip not in ordered]  # 2)
+    ordered += [ip for ip in sorted(lan_ips) if _is_dockerish(ip) and ip not in ordered]      # 3)
+
+    subnets = []
+    for ip in ordered:
+        net = str(ipaddress.ip_network(f"{ip}/24", strict=False))
+        if net not in subnets:
+            subnets.append(net)
+
+    # If we have a real (non-docker) LAN subnet, don't waste time sweeping docker bridges.
+    non_docker = [n for n in subnets if not _is_dockerish(n.split("/")[0])]
+    chosen = non_docker or subnets
+
+    if chosen:
+        log(f"LAN subnet(s) to sweep: {chosen}"
+            + (" (docker bridges skipped)" if non_docker and len(subnets) > len(non_docker) else ""))
+    else:
+        log("could not derive a LAN subnet — set 'subnets' in the add-on options "
+            "(e.g. 192.168.1.0/24) so discovery knows where to look.")
+    return chosen
 
 
 def discover_mdns(timeout=4):
-    """Find Tasmota devices advertised over mDNS. Returns a set of IPs. Best-effort (needs zeroconf)."""
+    """Find Tasmota devices advertised over mDNS. Returns a set of IPs. Best-effort — must NEVER raise:
+    Zeroconf()/ServiceBrowser can throw when the add-on container can't bind the mDNS multicast
+    socket, and that used to crash the whole add-on ~20s in. Every failure here → empty set."""
     ips = set()
     try:
         from zeroconf import Zeroconf, ServiceBrowser
@@ -100,11 +196,14 @@ def discover_mdns(timeout=4):
 
     class _L:
         def add_service(self, zc, type_, name):
-            info = zc.get_service_info(type_, name, timeout=2000)
-            if info:
-                for addr in info.parsed_addresses():
-                    if ":" not in addr:  # IPv4 only
-                        found.append(addr)
+            try:
+                info = zc.get_service_info(type_, name, timeout=2000)
+                if info:
+                    for addr in info.parsed_addresses():
+                        if ":" not in addr:  # IPv4 only
+                            found.append(addr)
+            except Exception:
+                pass
 
         def update_service(self, *a):
             pass
@@ -112,13 +211,20 @@ def discover_mdns(timeout=4):
         def remove_service(self, *a):
             pass
 
-    zc = Zeroconf()
+    zc = None
     try:
+        zc = Zeroconf()
         ServiceBrowser(zc, ["_tasmota._tcp.local.", "_http._tcp.local."], _L())
         time.sleep(timeout)
+    except Exception as e:
+        log(f"mDNS unavailable ({e}); relying on subnet sweep.")
     finally:
-        zc.close()
-    ips.update(found)
+        if zc is not None:
+            try:
+                zc.close()
+            except Exception:
+                pass
+    ips.update(a for a in found if _is_lan_ipv4(a))
     return ips
 
 
@@ -149,17 +255,26 @@ def discover_subnet():
 
 
 def discover_devices():
-    """Merge manual IPs + mDNS + subnet sweep into the full IP set to bridge."""
+    """Merge manual IPs + mDNS + subnet sweep into the full IP set to bridge.
+
+    Wrapped so a failure in either discovery method can never crash the add-on — it just
+    returns whatever it has (at least the manual IPs)."""
     ips = set(MANUAL_DEVICES)
     if AUTODISCOVER:
-        m = discover_mdns()
-        if m:
-            log(f"mDNS found: {sorted(m)}")
-        ips |= m
-        s = discover_subnet()
-        if s:
-            log(f"subnet sweep found: {sorted(s)}")
-        ips |= s
+        try:
+            m = discover_mdns()
+            if m:
+                log(f"mDNS found: {sorted(m)}")
+            ips |= m
+        except Exception as e:
+            log(f"mDNS discovery error (continuing): {e}")
+        try:
+            s = discover_subnet()
+            if s:
+                log(f"subnet sweep found: {sorted(s)}")
+            ips |= s
+        except Exception as e:
+            log(f"subnet sweep error (continuing): {e}")
     return sorted(ips)
 
 
@@ -354,12 +469,17 @@ class Bridge:
             log("no devices discovered yet. Auto-discovery will keep retrying; "
                 "you can also add IPs manually in the add-on Configuration tab.")
 
+        # Connect to MQTT, RETRYING forever — never exit the add-on just because the broker
+        # isn't up yet. Exiting here was the "add-on stops after ~20s" symptom.
         log(f"connecting to HA MQTT broker {MQTT_HOST}:{MQTT_PORT} …")
-        try:
-            self.client.connect(MQTT_HOST, MQTT_PORT, 60)
-        except Exception as e:
-            log(f"MQTT connect FAILED: {e}. Is the 'Mosquitto broker' add-on installed & running?")
-            raise
+        while True:
+            try:
+                self.client.connect(MQTT_HOST, MQTT_PORT, 60)
+                break
+            except Exception as e:
+                log(f"MQTT connect failed: {e}. Is the 'Mosquitto broker' add-on running? "
+                    f"Retrying in 10s…")
+                time.sleep(10)
         self.client.loop_start()
 
         # Announce everything we found up-front.
@@ -368,19 +488,23 @@ class Bridge:
                 log(f"{ip}: could not read device (unreachable or not an HBot) — will retry.")
 
         # Re-discover roughly every ~2 min so newly powered-on devices appear without a restart.
+        # The whole loop is guarded so a transient error never kills the add-on.
         rediscover_every = max(1, int(120 / max(POLL, 1)))
         tick = 0
         while True:
             tick += 1
-            if AUTODISCOVER and tick % rediscover_every == 0:
-                for ip in discover_devices():
-                    if ip not in self.devices and self.add_device(ip):
-                        log(f"{ip}: newly discovered and added.")
-            for ip, d in list(self.devices.items()):
-                try:
-                    self.poll_once(d)
-                except Exception as e:
-                    log(f"{ip}: poll error {e}")
+            try:
+                if AUTODISCOVER and tick % rediscover_every == 0:
+                    for ip in discover_devices():
+                        if ip not in self.devices and self.add_device(ip):
+                            log(f"{ip}: newly discovered and added.")
+                for ip, d in list(self.devices.items()):
+                    try:
+                        self.poll_once(d)
+                    except Exception as e:
+                        log(f"{ip}: poll error {e}")
+            except Exception as e:
+                log(f"loop error (continuing): {e}")
             time.sleep(POLL)
 
 
