@@ -1,8 +1,10 @@
 #!/usr/bin/with-contenv bashio
 # Read the add-on options + the MQTT service HA gives us, then hand them to the bridge as env vars.
 
-# Devices list (user-entered IPs) → comma-separated for the python bridge.
+# Devices list (optional user-entered IPs) → comma-separated for the python bridge.
 DEVICES=$(bashio::config 'devices | join(",")')
+SUBNETS=$(bashio::config 'subnets | join(",")')
+AUTODISCOVER=$(bashio::config 'autodiscover')
 POLL=$(bashio::config 'poll_interval')
 PREFIX=$(bashio::config 'discovery_prefix')
 
@@ -18,8 +20,10 @@ else
 fi
 
 export HBOT_DEVICES="$DEVICES"
+export HBOT_SUBNETS="$SUBNETS"
+export HBOT_AUTODISCOVER="$AUTODISCOVER"
 export HBOT_POLL="$POLL"
 export HBOT_PREFIX="$PREFIX"
 
-bashio::log.info "HBot starting — devices: ${DEVICES}, MQTT: ${MQTT_HOST}:${MQTT_PORT}, poll ${POLL}s"
+bashio::log.info "HBot starting — autodiscover: ${AUTODISCOVER}, manual devices: ${DEVICES:-none}, subnets: ${SUBNETS:-auto}, MQTT: ${MQTT_HOST}:${MQTT_PORT}, poll ${POLL}s"
 exec python3 /hbot_bridge.py

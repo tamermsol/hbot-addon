@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """HBot bridge — brings H-Bot (Tasmota) devices into Home Assistant over the LAN.
 
-For each device IP (from the add-on options) it:
+It auto-discovers HBot (Tasmota) devices on your local network — no IPs to type — via
+  • mDNS (`_tasmota._tcp` / `_http._tcp`), and
+  • a subnet sweep that probes every host on the HA LAN with `Status 0` and keeps the ones
+    that answer like an HBot device.
+Any IPs you DO type in the add-on options are always included as a manual override.
+
+For each discovered device IP it then:
   1. reads Tasmota `Status 0` over HTTP (http://<ip>/cm?cmnd=Status%200) to learn topic/channels/type,
   2. publishes HA MQTT discovery to HA's built-in Mosquitto so the entity appears automatically,
   3. subscribes to the HA command topics and relays them to the device's HTTP API (POWERn/Shutter*),
@@ -9,9 +15,12 @@ For each device IP (from the add-on options) it:
 
 No cloud broker: everything runs on the local network via the device HTTP API + HA's own MQTT.
 """
+import ipaddress
 import json
 import os
+import socket
 import time
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote
 import requests
 import paho.mqtt.client as mqtt
@@ -22,13 +31,136 @@ MQTT_USER = os.environ.get("MQTT_USER", "")
 MQTT_PASS = os.environ.get("MQTT_PASS", "")
 PREFIX = os.environ.get("HBOT_PREFIX", "homeassistant")
 POLL = int(os.environ.get("HBOT_POLL", "10"))
-DEVICES = [d.strip() for d in os.environ.get("HBOT_DEVICES", "").split(",") if d.strip()]
+# Manually-entered IPs are optional now — they're merged with auto-discovered ones.
+MANUAL_DEVICES = [d.strip() for d in os.environ.get("HBOT_DEVICES", "").split(",") if d.strip()]
+AUTODISCOVER = os.environ.get("HBOT_AUTODISCOVER", "true").lower() not in ("false", "0", "no")
+# Optional explicit subnet(s) to sweep, e.g. "192.168.1.0/24". Empty = derive from HA's own IP.
+SCAN_SUBNETS = [s.strip() for s in os.environ.get("HBOT_SUBNETS", "").split(",") if s.strip()]
 
 HTTP_TIMEOUT = 5
+PROBE_TIMEOUT = 1.5  # short per-host timeout for the subnet sweep
+SCAN_WORKERS = 64
 
 
 def log(*a):
     print("[hbot]", *a, flush=True)
+
+
+# ── auto-discovery ──────────────────────────────────────────────────────────
+def _looks_like_hbot(status):
+    """True if a `Status 0` JSON reply looks like an HBot/Tasmota device."""
+    if not isinstance(status, dict):
+        return False
+    # Tasmota Status 0 always carries a "Status" block with a Topic; HBot topics start "hbot"/"Hbot".
+    st = status.get("Status")
+    if not isinstance(st, dict):
+        return False
+    topic = str(st.get("Topic") or "")
+    # Accept any Tasmota device (has Topic + FriendlyName), and prefer HBot-named topics.
+    return bool(topic) and ("FriendlyName" in st or "Module" in st)
+
+
+def _probe_ip(ip):
+    """Cheap reachability + identity probe for the subnet sweep. Returns ip if it's an HBot, else None."""
+    url = f"http://{ip}/cm?cmnd={quote('Status 0', safe='')}"
+    try:
+        r = requests.get(url, timeout=PROBE_TIMEOUT)
+        if r.status_code == 200 and _looks_like_hbot(r.json()):
+            return ip
+    except Exception:
+        pass
+    return None
+
+
+def _local_subnets():
+    """Derive candidate /24 subnets from the host's own IPv4 addresses."""
+    subnets = []
+    try:
+        # UDP connect doesn't send packets but picks the primary outbound interface IP.
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        host_ip = s.getsockname()[0]
+        s.close()
+        net = ipaddress.ip_network(f"{host_ip}/24", strict=False)
+        subnets.append(str(net))
+    except Exception as e:
+        log(f"could not derive local subnet: {e}")
+    return subnets
+
+
+def discover_mdns(timeout=4):
+    """Find Tasmota devices advertised over mDNS. Returns a set of IPs. Best-effort (needs zeroconf)."""
+    ips = set()
+    try:
+        from zeroconf import Zeroconf, ServiceBrowser
+    except Exception:
+        return ips  # zeroconf not installed / unavailable — the subnet sweep covers us
+
+    found = []
+
+    class _L:
+        def add_service(self, zc, type_, name):
+            info = zc.get_service_info(type_, name, timeout=2000)
+            if info:
+                for addr in info.parsed_addresses():
+                    if ":" not in addr:  # IPv4 only
+                        found.append(addr)
+
+        def update_service(self, *a):
+            pass
+
+        def remove_service(self, *a):
+            pass
+
+    zc = Zeroconf()
+    try:
+        ServiceBrowser(zc, ["_tasmota._tcp.local.", "_http._tcp.local."], _L())
+        time.sleep(timeout)
+    finally:
+        zc.close()
+    ips.update(found)
+    return ips
+
+
+def discover_subnet():
+    """Sweep the local subnet(s) with a quick Status 0 probe. Returns a set of HBot IPs."""
+    hosts = []
+    for cidr in (SCAN_SUBNETS or _local_subnets()):
+        try:
+            net = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            log(f"ignoring invalid subnet '{cidr}'")
+            continue
+        # Cap sweeps to /24-sized ranges so we never scan the whole internet by mistake.
+        if net.num_addresses > 512:
+            log(f"subnet {cidr} too large ({net.num_addresses} hosts) — limiting to first 254")
+            hosts.extend(str(h) for h in list(net.hosts())[:254])
+        else:
+            hosts.extend(str(h) for h in net.hosts())
+    if not hosts:
+        return set()
+    log(f"sweeping {len(hosts)} host(s) for HBot devices …")
+    found = set()
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
+        for ip in ex.map(_probe_ip, hosts):
+            if ip:
+                found.add(ip)
+    return found
+
+
+def discover_devices():
+    """Merge manual IPs + mDNS + subnet sweep into the full IP set to bridge."""
+    ips = set(MANUAL_DEVICES)
+    if AUTODISCOVER:
+        m = discover_mdns()
+        if m:
+            log(f"mDNS found: {sorted(m)}")
+        ips |= m
+        s = discover_subnet()
+        if s:
+            log(f"subnet sweep found: {sorted(s)}")
+        ips |= s
+    return sorted(ips)
 
 
 def tasmota(ip, cmnd):
@@ -196,28 +328,31 @@ class Bridge:
                 if val in ("ON", "OFF"):
                     self.client.publish(f"hbot/{base}/{i}/state", val, retain=True)
 
+    def add_device(self, ip):
+        """Probe a newly-seen IP and, if it's a real HBot, register + announce it. Returns True if added."""
+        if ip in self.devices:
+            return False
+        d = Device(ip)
+        if d.probe():
+            self.devices[ip] = d
+            self.announce(d)
+            log(f"{ip}: read OK → topic={d.topic} name='{d.name}' "
+                f"{'shutter' if d.shutter else str(d.channels)+'ch'}")
+            return True
+        return False
+
     def run(self):
-        log(f"config: devices={DEVICES} mqtt={MQTT_HOST}:{MQTT_PORT} prefix={PREFIX} poll={POLL}s")
-        if not DEVICES:
-            log("NO DEVICE IPS configured — add device IPs in the add-on Configuration tab.")
-        # Probe devices first so we know their topics/channels before announcing.
-        for ip in DEVICES:
-            d = Device(ip)
-            ok = False
-            for attempt in range(3):
-                if d.probe():
-                    ok = True
-                    break
-                log(f"{ip}: probe attempt {attempt+1}/3 failed, retrying…")
-                time.sleep(2)
-            if ok:
-                self.devices[ip] = d
-                log(f"{ip}: read OK → topic={d.topic} name='{d.name}' {'shutter' if d.shutter else str(d.channels)+'ch'}")
-            else:
-                log(f"{ip}: COULD NOT READ device. Check the IP is correct and reachable from HA "
-                    f"(try http://{ip}/ in a browser on the HA network). Skipping for now.")
-        if not self.devices:
-            log("no reachable devices yet; will keep retrying every poll.")
+        log(f"config: manual={MANUAL_DEVICES} autodiscover={AUTODISCOVER} "
+            f"subnets={SCAN_SUBNETS or 'auto'} mqtt={MQTT_HOST}:{MQTT_PORT} prefix={PREFIX} poll={POLL}s")
+
+        # Discover the device IPs (manual + mDNS + subnet sweep) before announcing.
+        log("discovering HBot devices on the LAN …")
+        ips = discover_devices()
+        if ips:
+            log(f"candidate device IPs: {ips}")
+        else:
+            log("no devices discovered yet. Auto-discovery will keep retrying; "
+                "you can also add IPs manually in the add-on Configuration tab.")
 
         log(f"connecting to HA MQTT broker {MQTT_HOST}:{MQTT_PORT} …")
         try:
@@ -227,16 +362,21 @@ class Bridge:
             raise
         self.client.loop_start()
 
+        # Announce everything we found up-front.
+        for ip in ips:
+            if not self.add_device(ip):
+                log(f"{ip}: could not read device (unreachable or not an HBot) — will retry.")
+
+        # Re-discover roughly every ~2 min so newly powered-on devices appear without a restart.
+        rediscover_every = max(1, int(120 / max(POLL, 1)))
+        tick = 0
         while True:
-            for ip in DEVICES:
-                d = self.devices.get(ip)
-                if d is None:
-                    # retry devices that were offline at start
-                    nd = Device(ip)
-                    if nd.probe():
-                        self.devices[ip] = nd
-                        self.announce(nd)
-                    continue
+            tick += 1
+            if AUTODISCOVER and tick % rediscover_every == 0:
+                for ip in discover_devices():
+                    if ip not in self.devices and self.add_device(ip):
+                        log(f"{ip}: newly discovered and added.")
+            for ip, d in list(self.devices.items()):
                 try:
                     self.poll_once(d)
                 except Exception as e:
