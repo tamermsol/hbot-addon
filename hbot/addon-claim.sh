@@ -28,23 +28,37 @@ if [[ -s "$TOKEN_FILE" && -s "$HOME_ID_FILE" ]]; then
   exit 0
 fi
 
-# Stable per-install identity. hbot-connect requires (code, ha_id) to match on /claim/status, so an
-# eavesdropper who saw the code alone still can't collect the token. Reuse across reboots.
+# Stable per-install identity. hbot-connect requires (code, ha_id) to match on /claim/status, so a
+# RESTART MUST reuse the SAME code+ha_id — otherwise the add-on polls a code the app never approved and
+# pairing deadlocks (the "new code every restart" bug). We derive BOTH deterministically from the HA
+# machine-id so they're identical across restarts even if /data was wiped; /data is just a cache.
+#
+# machine-id is stable for the life of the HAOS install. Fall back to a persisted random id only if it
+# is somehow unavailable (then /data must persist for stability — it normally does for add-ons).
+MID="$(cat /etc/machine-id 2>/dev/null || cat /data/.mid 2>/dev/null || true)"
+if [[ -z "$MID" ]]; then
+  MID="$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  printf '%s' "$MID" > /data/.mid 2>/dev/null || true
+fi
+
+# ha_id = deterministic from machine-id (persist a copy for readability/debug).
 if [[ -s "$HAID_FILE" ]]; then
   HA_ID="$(cat "$HAID_FILE")"
 else
-  HA_ID="ha-$( (cat /etc/machine-id 2>/dev/null || head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n') | head -c 24)-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-  printf '%s' "$HA_ID" > "$HAID_FILE"
+  HA_ID="ha-$(printf '%s' "$MID" | sha256sum | cut -c1-24)"
+  printf '%s' "$HA_ID" > "$HAID_FILE" 2>/dev/null || true
 fi
 
-# Short, human-readable code shown on the HA screen (also a bearer secret → made unguessable by the
-# random suffix). Reuse a persisted code so a restart mid-pairing keeps the same code the user sees.
+# code = deterministic from machine-id too, so the SAME code regenerates after a restart even if the
+# /data cache is gone. Still unguessable (derived from a per-install secret via SHA-256), and matches
+# the app-visible format HBOT + 8 uppercase hex. A persisted CODE_FILE takes precedence (if the app is
+# mid-pairing on a code the user already sees, never change it).
 if [[ -s "$CODE_FILE" ]]; then
   CODE="$(cat "$CODE_FILE")"
 else
-  SUFFIX="$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n' | tr 'a-f' 'A-F' | head -c 8)"
+  SUFFIX="$(printf 'hbot-claim:%s' "$MID" | sha256sum | tr 'a-f' 'A-F' | head -c 8)"
   CODE="HBOT${SUFFIX}"
-  printf '%s' "$CODE" > "$CODE_FILE"
+  printf '%s' "$CODE" > "$CODE_FILE" 2>/dev/null || true
 fi
 
 # Register (idempotent per code+ha_id). Non-fatal — retried each boot until the app approves.
