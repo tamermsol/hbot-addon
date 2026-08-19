@@ -1,5 +1,5 @@
 name: HBot
-version: "1.4.0"
+version: "1.4.1"
 slug: hbot
 description: Bring your H-Bot (Tasmota) devices into Home Assistant over your local network — no cloud. Optional one-tap remote access via a secure Cloudflare tunnel.
 url: https://github.com/tamermsol/hbot-addon
@@ -14,6 +14,10 @@ services:
   - mqtt:need
 # host_network lets the add-on reach devices directly on your LAN by their IP.
 host_network: true
+# homeassistant_api gives the add-on its SUPERVISOR_TOKEN access to the Core API
+# (http://supervisor/core/api/…). We use it to verify the token authenticates before writing it into
+# the H-Bot app's connection row, so pairing never leaves the app "connected but 401" (v1.4.1 fix).
+homeassistant_api: true
 init: false
 # User-editable options. Auto-discovery is ON by default, so `devices` is optional —
 # leave it empty and the add-on finds HBot devices on your LAN by itself.
