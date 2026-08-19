@@ -22,6 +22,7 @@ RUN case "${BUILD_ARCH}" in \
 COPY run.sh /run.sh
 COPY hbot_bridge.py /hbot_bridge.py
 COPY addon-connect.sh /addon-connect.sh
-RUN chmod a+x /run.sh /addon-connect.sh
+COPY addon-claim.sh /addon-claim.sh
+RUN chmod a+x /run.sh /addon-connect.sh /addon-claim.sh
 
 CMD [ "/run.sh" ]

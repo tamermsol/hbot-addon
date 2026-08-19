@@ -40,18 +40,35 @@ export HBOT_ACCOUNT_PASSWORD="$ACCOUNT_PASSWORD"
 # working LAN-only. cloudflared holds the tunnel open; the bridge is the foreground process below.
 HOME_ID=$(bashio::config 'home_id')
 PROV_TOKEN=$(bashio::config 'provisioning_token')
+export HBOT_CONNECT_URL="$(bashio::config 'hbot_connect_url')"
+export SUPABASE_URL="$(bashio::config 'supabase_url')"
+export SUPABASE_ANON_KEY="$(bashio::config 'supabase_anon_key')"
+mkdir -p /data
+
+# Legacy/manual path: the user pasted home_id + provisioning_token into the add-on options.
 if [[ -n "$HOME_ID" && -n "$PROV_TOKEN" ]]; then
-  # Persist the paired identity where addon-connect.sh expects it.
-  mkdir -p /data
   printf '%s' "$HOME_ID" > /data/home_id
   printf '%s' "$PROV_TOKEN" > /data/provisioning_token
-  export HBOT_CONNECT_URL="$(bashio::config 'hbot_connect_url')"
-  export SUPABASE_URL="$(bashio::config 'supabase_url')"
-  export SUPABASE_ANON_KEY="$(bashio::config 'supabase_anon_key')"
-  bashio::log.info "HBot remote access: paired (home ${HOME_ID}) — opening Cloudflare tunnel via ${HBOT_CONNECT_URL}"
-  ( /addon-connect.sh || bashio::log.warning "HBot remote access: tunnel provisioning failed — continuing LAN-only." ) &
+fi
+
+# Zero-typing pairing (the default): if we aren't paired yet, announce a claim to hbot-connect and
+# poll for the app to approve it. Runs in the BACKGROUND so the bridge (below) starts immediately and
+# devices work on the LAN while the user pairs. On approval it persists /data/{home_id,provisioning_token}
+# then opens the Cloudflare tunnel. Fully non-fatal — an unpaired HA just stays LAN-only.
+if [[ -n "${HBOT_CONNECT_URL:-}" ]]; then
+  (
+    if [[ ! -s /data/provisioning_token || ! -s /data/home_id ]]; then
+      /addon-claim.sh || bashio::log.warning "HBot pairing: claim flow errored — LAN-only for now."
+    fi
+    if [[ -s /data/provisioning_token && -s /data/home_id ]]; then
+      bashio::log.info "HBot remote access: paired (home $(cat /data/home_id)) — opening Cloudflare tunnel via ${HBOT_CONNECT_URL}"
+      /addon-connect.sh || bashio::log.warning "HBot remote access: tunnel provisioning failed — continuing LAN-only."
+    else
+      bashio::log.info "HBot remote access: not paired yet — LAN-only. Pair this HA in the H-Bot app (Settings -> Home Assistant)."
+    fi
+  ) &
 else
-  bashio::log.info "HBot remote access: not paired — LAN-only (pair this HA in the H-Bot app to enable remote access)."
+  bashio::log.info "HBot remote access: hbot_connect_url unset — LAN-only."
 fi
 
 bashio::log.info "HBot starting — account: ${ACCOUNT_EMAIL:-none}, autodiscover: ${AUTODISCOVER}, manual devices: ${DEVICES:-none}, subnets: ${SUBNETS:-auto}, debug: ${DEBUG}, MQTT: ${MQTT_HOST}:${MQTT_PORT}, poll ${POLL}s"
