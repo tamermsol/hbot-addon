@@ -35,6 +35,25 @@ export HBOT_DEBUG="$DEBUG"
 export HBOT_ACCOUNT_EMAIL="$ACCOUNT_EMAIL"
 export HBOT_ACCOUNT_PASSWORD="$ACCOUNT_PASSWORD"
 
+# ── Optional remote access: open a Cloudflare tunnel if this HA is paired to a home (BURDEN 1) ──
+# Runs in the BACKGROUND and is fully non-fatal — if unpaired or provisioning fails, the add-on keeps
+# working LAN-only. cloudflared holds the tunnel open; the bridge is the foreground process below.
+HOME_ID=$(bashio::config 'home_id')
+PROV_TOKEN=$(bashio::config 'provisioning_token')
+if [[ -n "$HOME_ID" && -n "$PROV_TOKEN" ]]; then
+  # Persist the paired identity where addon-connect.sh expects it.
+  mkdir -p /data
+  printf '%s' "$HOME_ID" > /data/home_id
+  printf '%s' "$PROV_TOKEN" > /data/provisioning_token
+  export HBOT_CONNECT_URL="$(bashio::config 'hbot_connect_url')"
+  export SUPABASE_URL="$(bashio::config 'supabase_url')"
+  export SUPABASE_ANON_KEY="$(bashio::config 'supabase_anon_key')"
+  bashio::log.info "HBot remote access: paired (home ${HOME_ID}) — opening Cloudflare tunnel via ${HBOT_CONNECT_URL}"
+  ( /addon-connect.sh || bashio::log.warning "HBot remote access: tunnel provisioning failed — continuing LAN-only." ) &
+else
+  bashio::log.info "HBot remote access: not paired — LAN-only (pair this HA in the H-Bot app to enable remote access)."
+fi
+
 bashio::log.info "HBot starting — account: ${ACCOUNT_EMAIL:-none}, autodiscover: ${AUTODISCOVER}, manual devices: ${DEVICES:-none}, subnets: ${SUBNETS:-auto}, debug: ${DEBUG}, MQTT: ${MQTT_HOST}:${MQTT_PORT}, poll ${POLL}s"
 # `exec` so signals reach python; if python ever exits, the trap logs it (should never happen).
 exec python3 /hbot_bridge.py

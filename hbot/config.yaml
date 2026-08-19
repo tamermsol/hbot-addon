@@ -1,7 +1,7 @@
 name: HBot
-version: "1.2.1"
+version: "1.3.0"
 slug: hbot
-description: Bring your H-Bot (Tasmota) devices into Home Assistant over your local network — no cloud.
+description: Bring your H-Bot (Tasmota) devices into Home Assistant over your local network — no cloud. Optional one-tap remote access via a secure Cloudflare tunnel.
 url: https://github.com/tamermsol/hbot-addon
 arch:
   - aarch64
@@ -30,6 +30,14 @@ options:
   poll_interval: 10
   discovery_prefix: homeassistant
   debug: false
+  # Remote access (optional). When home_id + provisioning_token are set (auto-filled when you pair
+  # this HA in the H-Bot app), the add-on opens a secure Cloudflare tunnel on first boot so the app
+  # reaches HA from anywhere — no port forwarding, no cloud subscription. Leave blank for LAN-only.
+  hbot_connect_url: "https://connect.aiawareworld.tech"
+  home_id: ""
+  provisioning_token: ""
+  supabase_url: ""
+  supabase_anon_key: ""
 schema:
   account_email: str?
   account_password: password?
@@ -41,3 +49,8 @@ schema:
   poll_interval: int(2,300)
   discovery_prefix: str
   debug: bool
+  hbot_connect_url: str?
+  home_id: str?
+  provisioning_token: password?
+  supabase_url: str?
+  supabase_anon_key: password?
