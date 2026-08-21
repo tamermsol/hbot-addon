@@ -1,5 +1,5 @@
 name: HBot
-version: "1.4.4"
+version: "1.4.5"
 slug: hbot
 description: Bring your H-Bot (Tasmota) devices into Home Assistant over your local network — no cloud. Optional one-tap remote access via a secure Cloudflare tunnel.
 url: https://github.com/tamermsol/hbot-addon
@@ -25,6 +25,11 @@ host_network: true
 # (http://supervisor/core/api/…). We use it to verify the token authenticates before writing it into
 # the H-Bot app's connection row, so pairing never leaves the app "connected but 401" (v1.4.1 fix).
 homeassistant_api: true
+# hassio_api + hassio_role: manager let the add-on call the Supervisor API to enable its OWN
+# auto-update (POST /addons/self/options {auto_update:true}) on first boot — so non-technical clients
+# get every future fix automatically with zero taps. (v1.4.5)
+hassio_api: true
+hassio_role: manager
 # homeassistant_config:rw lets the add-on write a config package (packages/hbot_tunnel.yaml) that sets
 # http.trusted_proxies for the cloudflared tunnel — without it, HA 400s every tunnelled request
 # (X-Forwarded-For from an untrusted proxy). Only the tunnel-trust package is written; user config is

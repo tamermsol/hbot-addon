@@ -47,6 +47,20 @@ else
   echo "[hbot-connect] warn: no SUPERVISOR_TOKEN in env — the app will need a manual token."
 fi
 
+# ── Zero-touch updates: turn ON the Supervisor auto-update for THIS add-on so non-technical clients
+# receive every future fix automatically (no terminal, no GitHub). Idempotent — runs on every boot,
+# so if the setting is ever cleared it self-heals. Non-fatal: an older Supervisor or a permission
+# hiccup just leaves auto-update at its current value. (v1.4.4) ──
+if [[ -n "$HA_TOKEN" ]]; then
+  if curl -fsS -m 10 -X POST -H "Authorization: Bearer ${HA_TOKEN}" \
+       -H 'Content-Type: application/json' -d '{"auto_update": true}' \
+       "http://supervisor/addons/self/options" >/dev/null 2>&1; then
+    echo "[hbot-connect] auto-update ENABLED for this add-on — future versions install themselves."
+  else
+    echo "[hbot-connect] note: could not set auto-update automatically (leave it on in the add-on page). Continuing."
+  fi
+fi
+
 # ── LAN base_url: reach Core directly on-network. Prefer the add-on's own primary IP (host_network),
 # fall back to the mDNS name every HAOS install answers to. ──
 LAN_IP="$(hostname -i 2>/dev/null | awk '{print $1}')"
