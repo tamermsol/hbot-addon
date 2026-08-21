@@ -19,6 +19,7 @@ import ipaddress
 import json
 import os
 import socket
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote
@@ -65,6 +66,31 @@ ACCOUNT_MACS = None
 
 def log(*a):
     print("[hbot]", *a, flush=True)
+
+
+# ── Health endpoint for the Supervisor watchdog ─────────────────────────────
+# The add-on declares `watchdog: tcp://[HOST]:[PORT:8099]` so the Supervisor polls this port; if the
+# whole add-on ever wedges (process alive but not serving), the watchdog restarts it. A plain TCP
+# accept loop is enough — the watchdog only checks that the port accepts a connection.
+HEALTH_PORT = int(os.environ.get("HBOT_HEALTH_PORT", "8099"))
+
+def _start_health_listener():
+    def serve():
+        try:
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("0.0.0.0", HEALTH_PORT))
+            srv.listen(8)
+            log(f"health listener up on :{HEALTH_PORT} (Supervisor watchdog target)")
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            log(f"health listener could not bind :{HEALTH_PORT}: {e} (watchdog disabled, add-on continues)")
+    threading.Thread(target=serve, name="health", daemon=True).start()
 
 
 # ── account scoping (Option 2) ──────────────────────────────────────────────
@@ -668,6 +694,9 @@ class Bridge:
         return False
 
     def run(self):
+        # Bring the watchdog health port up first thing, before any slow discovery/MQTT work, so the
+        # Supervisor sees the add-on as healthy from the very start.
+        _start_health_listener()
         log(f"config: manual={MANUAL_DEVICES} autodiscover={AUTODISCOVER} "
             f"subnets={SCAN_SUBNETS or 'auto'} account={ACCOUNT_EMAIL or 'none'} "
             f"mqtt={MQTT_HOST}:{MQTT_PORT} prefix={PREFIX} poll={POLL}s")
