@@ -596,11 +596,18 @@ class Bridge:
         if MQTT_USER:
             self.client.username_pw_set(MQTT_USER, MQTT_PASS)
         self.client.on_connect = self._on_connect
+        self.client.on_disconnect = self._on_disconnect
         self.client.on_message = self._on_message
         self.devices = {}          # ip -> Device
         self.cmd_map = {}          # command_topic -> (ip, kind, index)
         self._connected_once = False   # True after the first successful MQTT connect
         self._need_rediscover = False  # set on a RE-connect so the main loop re-runs discovery
+        # Runtime broker-drop recovery (v1.4.8): after loop_start(), paho owns reconnects and the initial
+        # connect loop's ensure_broker_up() never runs again. Track live-connection state + when the drop
+        # began so the main loop can auto-start a broker that STOPS AT RUNTIME (not just at startup).
+        self._connected = False        # True between on_connect and on_disconnect
+        self._disconnected_since = None # monotonic ts of the current sustained disconnect, else None
+        self._last_broker_kick = 0.0    # monotonic ts of the last ensure_broker_up() during a drop
 
     # ── discovery ──
     def announce(self, d: Device):
@@ -688,6 +695,9 @@ class Bridge:
     def _on_connect(self, _client, _userdata, _flags, reason_code, *_args):
         # Signature covers paho 1.x (client,userdata,flags,rc) AND 2.x (…,reason_code,properties).
         log(f"connected to MQTT (rc={reason_code})")
+        # Live again → clear the runtime-drop recovery state so the monitor stops kicking the broker.
+        self._connected = True
+        self._disconnected_since = None
         # Re-announce + re-subscribe on every (re)connect so command topics are always live.
         for d in self.devices.values():
             self.announce(d)
@@ -698,6 +708,33 @@ class Bridge:
             self._need_rediscover = True
             log("MQTT reconnected — scheduling device rediscovery so nothing stays unavailable.")
         self._connected_once = True
+
+    def _on_disconnect(self, _client, _userdata, *args):
+        # paho 1.x: (client,userdata,rc); 2.x: (client,userdata,disconnect_flags,reason_code,properties).
+        # Records the RUNTIME drop so the main-loop monitor can auto-start a broker that stopped after
+        # startup (the initial connect loop's ensure_broker_up never runs again once loop_start owns
+        # reconnects). paho keeps trying to reconnect in the background; we only ASSIST after a grace.
+        rc = args[-1] if args else "?"
+        self._connected = False
+        if self._disconnected_since is None:
+            self._disconnected_since = time.monotonic()
+        log(f"disconnected from MQTT (rc={rc}) — paho will retry; monitoring for a sustained broker drop.")
+
+    # Called every main-loop tick: if we've been disconnected past the grace, ask the Supervisor to
+    # (re)start the broker, rate-limited by capped backoff. Stops as soon as _on_connect fires again.
+    # Idempotent + non-fatal. Grace/backoff are short so runtime recovery is quick but not chatty.
+    def _broker_drop_monitor(self, grace=40, min_kick_interval=45):
+        if self._connected or self._disconnected_since is None:
+            return
+        down_for = time.monotonic() - self._disconnected_since
+        if down_for < grace:
+            return  # brief blip — let paho self-recover without kicking the broker
+        now = time.monotonic()
+        if now - self._last_broker_kick < min_kick_interval:
+            return  # capped backoff — don't hammer the Supervisor
+        self._last_broker_kick = now
+        log(f"MQTT down for ~{int(down_for)}s (>{grace}s) — asking Supervisor to (re)start the broker.")
+        ensure_broker_up()
 
     # ── state polling: device HTTP → HA ──
     def poll_once(self, d: Device):
@@ -783,6 +820,10 @@ class Bridge:
         while True:
             tick += 1
             try:
+                # v1.4.8: recover a broker that DROPS AT RUNTIME. After loop_start() paho owns reconnects
+                # and never re-runs the initial connect loop's ensure_broker_up(); this monitor covers that
+                # gap — if we've been disconnected past the grace it (re)starts the broker with backoff.
+                self._broker_drop_monitor()
                 # Re-run discovery on the scheduled tick OR immediately after an MQTT reconnect (broker
                 # came back) so devices missed during the outage are re-added + re-announced at once.
                 due_rediscover = AUTODISCOVER and (tick % rediscover_every == 0)
