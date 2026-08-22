@@ -38,6 +38,34 @@ AUTODISCOVER = os.environ.get("HBOT_AUTODISCOVER", "true").lower() not in ("fals
 # Optional explicit subnet(s) to sweep, e.g. "192.168.1.0/24". Empty = derive from HA's own IP.
 SCAN_SUBNETS = [s.strip() for s in os.environ.get("HBOT_SUBNETS", "").split(",") if s.strip()]
 
+# Supervisor API — used to auto-start the Mosquitto broker add-on when the bridge can't reach it.
+# SUPERVISOR_TOKEN is injected into every add-on; hassio_api:true + hassio_role:manager (config.yaml)
+# authorize the /addons/<slug>/start call. core_mosquitto is HA's official broker add-on slug.
+SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN") or os.environ.get("HASSIO_TOKEN") or ""
+MOSQUITTO_SLUG = "core_mosquitto"
+
+
+def ensure_broker_up():
+    """Best-effort: ask the Supervisor to START the Mosquitto broker add-on. Called when the bridge
+    has repeatedly failed to reach MQTT (Errno 111/113). Returns True if the start request was accepted.
+    Never raises — a failure just means we keep retrying the plain connect. Idempotent (starting an
+    already-running add-on is a no-op on the Supervisor side)."""
+    if not SUPERVISOR_TOKEN:
+        return False
+    try:
+        r = requests.post(
+            f"http://supervisor/addons/{MOSQUITTO_SLUG}/start",
+            headers={"Authorization": f"Bearer {SUPERVISOR_TOKEN}"},
+            timeout=15,
+        )
+        if r.status_code in (200, 400):  # 400 = already running / not-startable-right-now → treat as "tried"
+            log(f"ensure_broker_up: requested Mosquitto broker start (HTTP {r.status_code}).")
+            return r.status_code == 200
+        log(f"ensure_broker_up: Supervisor returned HTTP {r.status_code} starting the broker.")
+    except Exception as e:
+        log(f"ensure_broker_up: could not reach Supervisor to start the broker ({e}).")
+    return False
+
 HTTP_TIMEOUT = 5
 # (connect, read) timeouts for the sweep. A short CONNECT timeout is what keeps a /24 sweep fast
 # even when many hosts silently drop SYNs (firewalled) instead of refusing — those would otherwise
@@ -571,6 +599,8 @@ class Bridge:
         self.client.on_message = self._on_message
         self.devices = {}          # ip -> Device
         self.cmd_map = {}          # command_topic -> (ip, kind, index)
+        self._connected_once = False   # True after the first successful MQTT connect
+        self._need_rediscover = False  # set on a RE-connect so the main loop re-runs discovery
 
     # ── discovery ──
     def announce(self, d: Device):
@@ -661,6 +691,13 @@ class Bridge:
         # Re-announce + re-subscribe on every (re)connect so command topics are always live.
         for d in self.devices.values():
             self.announce(d)
+        # If this is a RE-connect (broker went down→up), flag the main loop to re-run discovery so any
+        # devices missed while the broker was unreachable are picked up + re-announced immediately —
+        # otherwise they'd sit "unavailable" in HA until the ~2min rediscover tick.
+        if self._connected_once:
+            self._need_rediscover = True
+            log("MQTT reconnected — scheduling device rediscovery so nothing stays unavailable.")
+        self._connected_once = True
 
     # ── state polling: device HTTP → HA ──
     def poll_once(self, d: Device):
@@ -716,15 +753,23 @@ class Bridge:
         # Connect to MQTT, RETRYING forever — never exit the add-on just because the broker
         # isn't up yet. Exiting here was the "add-on stops after ~20s" symptom.
         log(f"connecting to HA MQTT broker {MQTT_HOST}:{MQTT_PORT} …")
+        attempt = 0
         while True:
             try:
                 self.client.connect(MQTT_HOST, MQTT_PORT, 60)
                 break
             except Exception as e:
-                log(f"MQTT connect failed: {e}. Is the 'Mosquitto broker' add-on running? "
-                    f"Retrying in 10s…")
-                time.sleep(10)
-        self.client.loop_start()
+                attempt += 1
+                # After a few failures the broker add-on is probably stopped/slow — ask the Supervisor
+                # to START it (best-effort), instead of spinning forever on Errno 111/113. Then keep
+                # retrying with capped backoff so we auto-recover the instant the broker is up.
+                if attempt in (3, 8) or attempt % 12 == 0:
+                    ensure_broker_up()
+                wait = min(10 + attempt * 2, 30)
+                log(f"MQTT connect failed (attempt {attempt}): {e}. Is the 'Mosquitto broker' add-on "
+                    f"running? Retrying in {wait}s…")
+                time.sleep(wait)
+        self.client.loop_start()  # paho auto-reconnects after drops; _on_connect flags rediscovery.
 
         # Announce everything we found up-front.
         for ip in ips:
@@ -738,7 +783,14 @@ class Bridge:
         while True:
             tick += 1
             try:
-                if AUTODISCOVER and tick % rediscover_every == 0:
+                # Re-run discovery on the scheduled tick OR immediately after an MQTT reconnect (broker
+                # came back) so devices missed during the outage are re-added + re-announced at once.
+                due_rediscover = AUTODISCOVER and (tick % rediscover_every == 0)
+                if self._need_rediscover:
+                    self._need_rediscover = False
+                    due_rediscover = True
+                    log("running post-reconnect rediscovery…")
+                if due_rediscover:
                     for ip in discover_devices():
                         if ip not in self.devices and self.add_device(ip):
                             log(f"{ip}: newly discovered and added.")

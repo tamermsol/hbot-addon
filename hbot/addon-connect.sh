@@ -130,15 +130,64 @@ ensure_trusted_proxies() {
     echo "    - 172.30.32.0/23"
     echo "    - 127.0.0.1"
     echo "    - ::1"
-  } > "$pkg" 2>/dev/null || true
-  echo "[hbot-connect] wrote trusted_proxies package; reloading Core config…"
-  # Validate + reload via Core service (no full restart needed for http trusted_proxies? http needs a
-  # restart — so request a Core restart, which HA schedules gracefully).
-  curl -fsS -m 10 -X POST -H "Authorization: Bearer ${HA_TOKEN}" \
-    "http://supervisor/core/api/services/homeassistant/restart" -H 'Content-Type: application/json' -d '{}' \
-    >/dev/null 2>&1 && echo "[hbot-connect] Core restart requested to apply trusted_proxies." \
-    || echo "[hbot-connect] warn: Core restart request failed — trusted_proxies will apply on next HA restart."
+  } > "$pkg.new" 2>/dev/null || true
+  # Only restart Core if the package actually CHANGED — avoids a Core restart (and the tunnel blip)
+  # on every add-on boot once trusted_proxies is already correct.
+  if [[ -f "$pkg" ]] && cmp -s "$pkg" "$pkg.new" 2>/dev/null; then
+    rm -f "$pkg.new" 2>/dev/null || true
+    echo "[hbot-connect] trusted_proxies already current — no Core restart needed."
+    return 0
+  fi
+  mv -f "$pkg.new" "$pkg" 2>/dev/null || true
+  echo "[hbot-connect] wrote trusted_proxies package; applying (Core restart needed for http config)…"
+
+  # http.trusted_proxies requires a Core restart to take effect. Do it RELIABLY: try the Core API and
+  # the Supervisor /core/restart endpoint, retry a few times, then VERIFY Core came back (poll /api/).
+  # Never leave the tunnel needing a MANUAL restart. The whole thing runs in the BACKGROUND so a slow
+  # Core restart doesn't delay cloudflared startup; TRUSTED_PROXIES_APPLYING signals the watchdog to
+  # hold its fire while Core is intentionally down (origin-down here is expected, not a tunnel fault).
+  ( _apply_trusted_proxies_restart ) &
 }
+
+# Request a Core restart, retrying across both endpoints, then confirm Core is reachable again.
+_apply_trusted_proxies_restart() {
+  : > "$TP_APPLYING_FLAG" 2>/dev/null || true   # watchdog: origin-down is EXPECTED during this window
+  local ok=0 i
+  for i in 1 2 3; do
+    # (a) Core API service call.
+    if curl -fsS -m 15 -X POST -H "Authorization: Bearer ${HA_TOKEN}" \
+         "http://supervisor/core/api/services/homeassistant/restart" \
+         -H 'Content-Type: application/json' -d '{}' >/dev/null 2>&1; then
+      echo "[hbot-connect] Core restart requested (attempt ${i}, Core API) to apply trusted_proxies."; ok=1; break
+    fi
+    # (b) Supervisor core restart (works even if the Core API is momentarily unauthorized/unavailable).
+    if curl -fsS -m 15 -X POST -H "Authorization: Bearer ${HA_TOKEN}" \
+         "http://supervisor/core/restart" >/dev/null 2>&1; then
+      echo "[hbot-connect] Core restart requested (attempt ${i}, Supervisor) to apply trusted_proxies."; ok=1; break
+    fi
+    echo "[hbot-connect] Core restart attempt ${i} failed — retrying in 10s…"; sleep 10
+  done
+  if [[ "$ok" -ne 1 ]]; then
+    echo "[hbot-connect] warn: could not trigger a Core restart after retries — will re-attempt on next boot."
+    rm -f "$TP_APPLYING_FLAG" 2>/dev/null || true
+    return 0
+  fi
+  # Verify Core actually comes back (up to ~3 min) so we KNOW trusted_proxies applied, not just requested.
+  local up=0 t
+  for t in $(seq 1 36); do
+    sleep 5
+    if curl -fsS -m 8 -o /dev/null -H "Authorization: Bearer ${HA_TOKEN}" "http://supervisor/core/api/" 2>/dev/null; then
+      up=1; echo "[hbot-connect] Core is back up — trusted_proxies applied (after ~$((t*5))s)."; break
+    fi
+  done
+  [[ "$up" -eq 1 ]] || echo "[hbot-connect] warn: Core not confirmed back within ~3min; it should finish restarting shortly."
+  rm -f "$TP_APPLYING_FLAG" 2>/dev/null || true   # restart window over — watchdog resumes normal judgement
+}
+
+# Flag file: present while we've DELIBERATELY restarted Core (origin will refuse briefly). The watchdog
+# reads it to avoid thrashing cloudflared during an expected origin-down window.
+TP_APPLYING_FLAG="/data/tp_applying"
+rm -f "$TP_APPLYING_FLAG" 2>/dev/null || true
 ensure_trusted_proxies
 
 echo "[hbot-connect] starting cloudflared → ${URL}"
@@ -155,29 +204,34 @@ WATCH_INTERVAL="${HBOT_TUNNEL_WATCH_INTERVAL:-30}"   # seconds between health ch
 WATCH_FAILS="${HBOT_TUNNEL_WATCH_FAILS:-3}"          # consecutive unhealthy checks → force reconnect (~90s)
 PUBLIC_URL="$URL"
 
-# One health check. Healthy if EITHER cloudflared reports >=1 registered HA connection (metrics)
-# OR the public URL answers 200/401 end-to-end (401 = HA reachable through the tunnel, demanding auth).
-# 1033/530/000 (CF "no origin"/edge error/unreachable) = unhealthy. Never throws (set -e safe).
-tunnel_healthy() {
-  # (a) cloudflared metrics: ha_connections gauge > 0 means the edge has a live connector.
-  local m
+# cloudflared edge-connection count: >0 means the connector is registered with the CF edge.
+# Returns the integer (0 if metrics unreachable / not yet up).
+cf_edge_connections() {
+  local m conns
   m="$(curl -fsS -m 5 "http://127.0.0.1:${CF_METRICS_PORT}/metrics" 2>/dev/null || true)"
-  if [[ -n "$m" ]]; then
-    local conns
-    conns="$(printf '%s\n' "$m" | awk '/^cloudflared_tunnel_ha_connections/ {print $2; exit}')"
-    if [[ -n "$conns" ]] && awk "BEGIN{exit !($conns > 0)}"; then
-      # metrics say connected — but STILL confirm the public URL serves (edge re-route can 1033
-      # while the connector count looks fine). Fall through to the URL probe as the source of truth.
-      :
-    fi
-  fi
-  # (b) end-to-end public probe — the authoritative signal the CLIENT experiences.
-  local code
+  [[ -z "$m" ]] && { echo 0; return; }
+  conns="$(printf '%s\n' "$m" | awk '/^cloudflared_tunnel_ha_connections/ {s+=$2} END{print s+0}')"
+  echo "${conns:-0}"
+}
+
+# Classify tunnel health into: "healthy" | "origin-down" | "edge-down". This is the v1.4.7 fix for
+# useless thrash: killing cloudflared only helps when the EDGE is down. If cloudflared is edge-connected
+# but the public URL fails, the ORIGIN (homeassistant:8123) is refusing — e.g. during a Core restart —
+# and relaunching cloudflared does nothing but churn. We must WAIT for Core in that case, not kill.
+#   • public probe 200/401/403           → healthy (origin alive, serving)
+#   • probe fails + edge connections >0   → origin-down (Core refusing; DON'T kill cloudflared)
+#   • probe fails + edge connections ==0  → edge-down (connector lost; relaunch cloudflared)
+#   • trusted_proxies Core restart in flight → force origin-down (expected, transient)
+tunnel_classify() {
+  local code edges
   code="$(curl -s -m 10 -o /dev/null -w '%{http_code}' "${PUBLIC_URL}/" 2>/dev/null || echo 000)"
   case "$code" in
-    200|401|403) return 0 ;;   # tunnel serving (401/403 = HA reachable, auth/forbidden — origin alive)
-    *) return 1 ;;             # 530/1033/502/000/… = tunnel not serving
+    200|401|403) echo "healthy"; return ;;
   esac
+  # Public URL is not serving. Distinguish edge vs origin.
+  if [[ -f "$TP_APPLYING_FLAG" ]]; then echo "origin-down"; return; fi   # we restarted Core on purpose
+  edges="$(cf_edge_connections)"
+  if awk "BEGIN{exit !($edges > 0)}"; then echo "origin-down"; else echo "edge-down"; fi
 }
 
 # The watchdog runs in a separate subshell and cannot see CF_PID (the supervisor reassigns it on every
@@ -191,27 +245,37 @@ start_cloudflared() {
   echo "[hbot-connect] cloudflared started pid=${CF_PID} (metrics 127.0.0.1:${CF_METRICS_PORT})."
 }
 
-# Watchdog: runs alongside cloudflared, kills it on sustained unhealth so the supervisor relaunches.
-# Fully non-fatal — any error here is caught and never kills the bridge/LAN path.
+# Watchdog: relaunches cloudflared ONLY on sustained EDGE-down; on ORIGIN-down it waits for Core to
+# return (killing cloudflared there is useless thrash). Fully non-fatal — never kills the bridge/LAN path.
 tunnel_watchdog() {
-  local fails=0 healthy_last=1
-  # Give the tunnel a startup grace period before the first judgement (initial QUIC + edge registration).
+  local edge_fails=0 healthy_last=1 state
+  # Startup grace before the first judgement (initial QUIC + edge registration).
   sleep 45
   while true; do
-    if tunnel_healthy; then
-      if [[ "$healthy_last" -eq 0 ]]; then echo "[hbot-watchdog] tunnel healthy again (${PUBLIC_URL})."; fi
-      healthy_last=1; fails=0
-    else
-      fails=$(( fails + 1 )); healthy_last=0
-      echo "[hbot-watchdog] tunnel UNHEALTHY ${fails}/${WATCH_FAILS} (public probe of ${PUBLIC_URL} failed — CF 1033/530/timeout)."
-      if [[ "$fails" -ge "$WATCH_FAILS" ]]; then
-        local pid; pid="$(cat "$CF_PID_FILE" 2>/dev/null || true)"
-        echo "[hbot-watchdog] forcing cloudflared reconnect (killing pid=${pid:-?} to trigger full relaunch)."
-        if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || true; fi
-        fails=0   # supervisor relaunch + startup grace resets the count
-        sleep "$WATCH_INTERVAL"
-      fi
-    fi
+    state="$(tunnel_classify)"
+    case "$state" in
+      healthy)
+        if [[ "$healthy_last" -eq 0 ]]; then echo "[hbot-watchdog] tunnel healthy again (${PUBLIC_URL})."; fi
+        healthy_last=1; edge_fails=0
+        ;;
+      origin-down)
+        # Edge connected (or Core deliberately restarting) but origin refusing → WAIT for Core, do NOT
+        # touch cloudflared. Reset the edge-fail counter so a Core restart never triggers a relaunch.
+        healthy_last=0; edge_fails=0
+        echo "[hbot-watchdog] origin-down: cloudflared edge is UP but HA Core is refusing (Core restart / booting). Waiting — NOT killing the tunnel."
+        ;;
+      edge-down)
+        edge_fails=$(( edge_fails + 1 )); healthy_last=0
+        echo "[hbot-watchdog] edge-down ${edge_fails}/${WATCH_FAILS}: cloudflared has no edge connection (public probe failed, ha_connections=0)."
+        if [[ "$edge_fails" -ge "$WATCH_FAILS" ]]; then
+          local pid; pid="$(cat "$CF_PID_FILE" 2>/dev/null || true)"
+          echo "[hbot-watchdog] forcing cloudflared reconnect (killing pid=${pid:-?} to trigger full relaunch)."
+          if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || true; fi
+          edge_fails=0   # supervisor relaunch + startup grace resets the count
+          sleep "$WATCH_INTERVAL"
+        fi
+        ;;
+    esac
     sleep "$WATCH_INTERVAL"
   done
 }
