@@ -108,9 +108,6 @@ ensure_trusted_proxies() {
   # /homeassistant is the Core config dir mapped into the add-on (map: homeassistant_config:rw).
   [[ -d /homeassistant ]] || { echo "[hbot-connect] warn: /homeassistant not mapped — cannot set trusted_proxies; tunnel may 400 until set manually."; return 0; }
   mkdir -p "$pkg_dir" 2>/dev/null || true
-  # Only (re)write if missing/different, so we don't churn Core reloads on every boot.
-  local want='homeassistant:
-  packages: !include_dir_named packages'
   # Ensure configuration.yaml includes packages (idempotent): if no "packages:" under homeassistant, add it.
   if ! grep -qE '^\s*packages:\s*!include_dir_named\s+packages' /homeassistant/configuration.yaml 2>/dev/null; then
     printf '\n# Added by HBot add-on so package files (incl. tunnel trusted_proxies) load.\nhomeassistant:\n  packages: !include_dir_named packages\n' >> /homeassistant/configuration.yaml 2>/dev/null || true
@@ -145,17 +142,91 @@ ensure_trusted_proxies() {
 ensure_trusted_proxies
 
 echo "[hbot-connect] starting cloudflared → ${URL}"
-# Supervised retry loop: if cloudflared ever exits (network blip, CF edge hiccup, CGNAT re-NAT), the
-# add-on used to stay "started" (the python bridge is the foreground process) while the tunnel stayed
-# DEAD — the app then saw Cloudflare 530/1033 with no self-healing. Wrap it so a drop reconnects
-# automatically with capped backoff. --retries and --grace-period make cloudflared itself hold on
-# harder before giving up a connection; the outer loop covers a full process exit.
+# ── Active tunnel health-watchdog (v1.4.6) ──────────────────────────────────────────────────────────
+# The prior supervisor only restarted cloudflared when the PROCESS EXITED. But CF error 1033 keeps the
+# process ALIVE while the tunnel is deregistered/not-serving (CF edge re-route, half-open QUIC, tunnel
+# token refresh, or the ensure_trusted_proxies Core restart landing mid-connect). Process up + tunnel
+# dead = the exit-only loop never fires = silent 1033 forever, and there was no probe of the real URL.
+# Fix: run cloudflared in the BACKGROUND (PID captured, capped-backoff relaunch on exit) AND a concurrent
+# watchdog that ACTIVELY checks liveness — cloudflared /ready metrics + an end-to-end probe of the public
+# URL. After N consecutive unhealthy checks it KILLS cloudflared so the loop does a full reconnect.
+CF_METRICS_PORT=36429                 # loopback-only cloudflared metrics endpoint
+WATCH_INTERVAL="${HBOT_TUNNEL_WATCH_INTERVAL:-30}"   # seconds between health checks
+WATCH_FAILS="${HBOT_TUNNEL_WATCH_FAILS:-3}"          # consecutive unhealthy checks → force reconnect (~90s)
+PUBLIC_URL="$URL"
+
+# One health check. Healthy if EITHER cloudflared reports >=1 registered HA connection (metrics)
+# OR the public URL answers 200/401 end-to-end (401 = HA reachable through the tunnel, demanding auth).
+# 1033/530/000 (CF "no origin"/edge error/unreachable) = unhealthy. Never throws (set -e safe).
+tunnel_healthy() {
+  # (a) cloudflared metrics: ha_connections gauge > 0 means the edge has a live connector.
+  local m
+  m="$(curl -fsS -m 5 "http://127.0.0.1:${CF_METRICS_PORT}/metrics" 2>/dev/null || true)"
+  if [[ -n "$m" ]]; then
+    local conns
+    conns="$(printf '%s\n' "$m" | awk '/^cloudflared_tunnel_ha_connections/ {print $2; exit}')"
+    if [[ -n "$conns" ]] && awk "BEGIN{exit !($conns > 0)}"; then
+      # metrics say connected — but STILL confirm the public URL serves (edge re-route can 1033
+      # while the connector count looks fine). Fall through to the URL probe as the source of truth.
+      :
+    fi
+  fi
+  # (b) end-to-end public probe — the authoritative signal the CLIENT experiences.
+  local code
+  code="$(curl -s -m 10 -o /dev/null -w '%{http_code}' "${PUBLIC_URL}/" 2>/dev/null || echo 000)"
+  case "$code" in
+    200|401|403) return 0 ;;   # tunnel serving (401/403 = HA reachable, auth/forbidden — origin alive)
+    *) return 1 ;;             # 530/1033/502/000/… = tunnel not serving
+  esac
+}
+
+# The watchdog runs in a separate subshell and cannot see CF_PID (the supervisor reassigns it on every
+# relaunch), so the current cloudflared pid is shared through a file both read.
+CF_PID_FILE="/data/cloudflared.pid"
+start_cloudflared() {
+  cloudflared tunnel --no-autoupdate --retries 10 --grace-period 30s \
+    --metrics "127.0.0.1:${CF_METRICS_PORT}" run --token "$TUNNEL_TOKEN" &
+  CF_PID=$!
+  printf '%s' "$CF_PID" > "$CF_PID_FILE" 2>/dev/null || true
+  echo "[hbot-connect] cloudflared started pid=${CF_PID} (metrics 127.0.0.1:${CF_METRICS_PORT})."
+}
+
+# Watchdog: runs alongside cloudflared, kills it on sustained unhealth so the supervisor relaunches.
+# Fully non-fatal — any error here is caught and never kills the bridge/LAN path.
+tunnel_watchdog() {
+  local fails=0 healthy_last=1
+  # Give the tunnel a startup grace period before the first judgement (initial QUIC + edge registration).
+  sleep 45
+  while true; do
+    if tunnel_healthy; then
+      if [[ "$healthy_last" -eq 0 ]]; then echo "[hbot-watchdog] tunnel healthy again (${PUBLIC_URL})."; fi
+      healthy_last=1; fails=0
+    else
+      fails=$(( fails + 1 )); healthy_last=0
+      echo "[hbot-watchdog] tunnel UNHEALTHY ${fails}/${WATCH_FAILS} (public probe of ${PUBLIC_URL} failed — CF 1033/530/timeout)."
+      if [[ "$fails" -ge "$WATCH_FAILS" ]]; then
+        local pid; pid="$(cat "$CF_PID_FILE" 2>/dev/null || true)"
+        echo "[hbot-watchdog] forcing cloudflared reconnect (killing pid=${pid:-?} to trigger full relaunch)."
+        if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || true; fi
+        fails=0   # supervisor relaunch + startup grace resets the count
+        sleep "$WATCH_INTERVAL"
+      fi
+    fi
+    sleep "$WATCH_INTERVAL"
+  done
+}
+( tunnel_watchdog || echo "[hbot-watchdog] watchdog loop exited (non-fatal)." ) &
+WATCH_PID=$!
+# If the whole script is torn down, take the watchdog + cloudflared with it.
+trap 'kill "${WATCH_PID:-}" "${CF_PID:-}" 2>/dev/null || true' EXIT
+
+# Supervisor: (re)launch cloudflared and restart it with capped backoff whenever the PROCESS exits —
+# whether from a real crash OR from the watchdog killing a wedged (1033) connector.
 backoff=2
 while true; do
-  cloudflared tunnel --no-autoupdate --retries 10 --grace-period 30s run --token "$TUNNEL_TOKEN"
-  rc=$?
+  start_cloudflared
+  wait "$CF_PID"; rc=$?
   echo "[hbot-connect] cloudflared exited rc=$rc — reconnecting in ${backoff}s (tunnel auto-heal)."
   sleep "$backoff"
-  # exponential backoff capped at 60s so a persistent outage doesn't hammer the CF edge.
   backoff=$(( backoff * 2 )); [ "$backoff" -gt 60 ] && backoff=60
 done
