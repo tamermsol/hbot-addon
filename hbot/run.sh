@@ -71,6 +71,44 @@ else
   bashio::log.info "HBot remote access: hbot_connect_url unset — LAN-only."
 fi
 
+# ── Self-update pump (v1.4.9): make version bumps reach clients WITHOUT a manual Rebuild ────────────
+# Root cause of "HA shows Up-to-date after a repo bump": the Supervisor caches the add-on repo git clone
+# and only re-pulls on its own ~daily schedule, so a fresh commit is invisible for up to a day. From
+# INSIDE the add-on (SUPERVISOR_TOKEN + hassio_role:manager) we can force it: POST /store/reload re-pulls
+# every repository (this is exactly what `ha store reload` does — Supervisor api/store.py::reload bound to
+# POST /store/reload), then GET /addons/self/info exposes update_available/version_latest, and if a newer
+# version is now visible AND auto-update is on we self-update via POST /addons/self/update. Best-effort,
+# non-fatal, backgrounded so it never delays the bridge/tunnel; a short delay lets Supervisor settle.
+SUP_TOKEN="${SUPERVISOR_TOKEN:-${HASSIO_TOKEN:-}}"
+if [[ -n "$SUP_TOKEN" ]]; then
+  (
+    sleep 20   # let the Supervisor finish bringing the add-on up before poking the store
+    if curl -fsS -m 30 -X POST -H "Authorization: Bearer ${SUP_TOKEN}" \
+         "http://supervisor/store/reload" >/dev/null 2>&1; then
+      bashio::log.info "self-update: store reloaded (repo git clones re-pulled) — future version bumps now visible."
+    else
+      bashio::log.warning "self-update: store reload request failed (non-fatal; Supervisor will reload on its own schedule)."
+    fi
+    # After the reload, is a newer version of THIS add-on now visible? If so, install it (auto-update path).
+    info="$(curl -fsS -m 15 -H "Authorization: Bearer ${SUP_TOKEN}" "http://supervisor/addons/self/info" 2>/dev/null || true)"
+    upd="$(printf '%s' "$info" | sed -n 's/.*"update_available"[: ]*\(true\|false\).*/\1/p')"
+    latest="$(printf '%s' "$info" | sed -n 's/.*"version_latest"[: ]*"\([^"]*\)".*/\1/p')"
+    if [[ "$upd" == "true" ]]; then
+      bashio::log.info "self-update: newer version ${latest:-?} available — requesting self-update…"
+      if curl -fsS -m 120 -X POST -H "Authorization: Bearer ${SUP_TOKEN}" \
+           "http://supervisor/addons/self/update" >/dev/null 2>&1; then
+        bashio::log.info "self-update: update to ${latest:-latest} requested (Supervisor will install + restart the add-on)."
+      else
+        bashio::log.warning "self-update: self-update request failed (non-fatal; auto-update will retry)."
+      fi
+    else
+      bashio::log.info "self-update: already on the latest visible version after store reload."
+    fi
+  ) &
+else
+  bashio::log.warning "self-update: no SUPERVISOR_TOKEN — cannot force a store reload; relying on Supervisor's own schedule."
+fi
+
 bashio::log.info "HBot starting — account: ${ACCOUNT_EMAIL:-none}, autodiscover: ${AUTODISCOVER}, manual devices: ${DEVICES:-none}, subnets: ${SUBNETS:-auto}, debug: ${DEBUG}, MQTT: ${MQTT_HOST}:${MQTT_PORT}, poll ${POLL}s"
 # `exec` so signals reach python; if python ever exits, the trap logs it (should never happen).
 exec python3 /hbot_bridge.py
