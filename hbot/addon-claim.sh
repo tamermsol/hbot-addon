@@ -61,11 +61,18 @@ else
   printf '%s' "$CODE" > "$CODE_FILE" 2>/dev/null || true
 fi
 
-# Register (idempotent per code+ha_id). Non-fatal — retried each boot until the app approves.
+# The base_url the app would independently DISCOVER this HA at (default: HA's in-network hostname).
+# hbot-connect uses it to safely auto-bind a fresh UNBOUND claim ONLY when the host matches the URL the
+# app discovered (see server.js pickUnboundAutoBind) — this is what makes the true 0-typing flow work
+# for a brand-new client that never told the add-on its home. Overridable for non-default HA ports.
+HA_DISCOVER_URL="${HA_DISCOVER_URL:-http://homeassistant:8123}"
+
+# Register (idempotent per code+ha_id). Non-fatal — retried each boot until the app approves. We declare
+# base_url so the server's host-match gate can auto-bind the single discovered HA with zero typing.
 register() {
   curl -fsS -X POST "${HBOT_CONNECT_URL}/claim/register" \
     -H 'Content-Type: application/json' \
-    --data "{\"code\":\"${CODE}\",\"ha_id\":\"${HA_ID}\"}" >/dev/null 2>&1 || return 1
+    --data "{\"code\":\"${CODE}\",\"ha_id\":\"${HA_ID}\",\"base_url\":\"${HA_DISCOVER_URL}\"}" >/dev/null 2>&1 || return 1
 }
 
 if ! register; then
