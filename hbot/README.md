@@ -1,13 +1,13 @@
 # HBot — Home Assistant add-on
 
-Bring your **H-Bot (Tasmota) devices** into Home Assistant over your **local network** — no cloud
+Bring your **H-Bot devices** into Home Assistant over your **local network** — no cloud
 broker, no per-device console commands. Your lights, panels and shutters appear as native HA entities
 and are controllable both ways.
 
 ## How it works
 
 The add-on **auto-discovers** your H-Bot devices on the LAN — no IPs to type. It finds them via:
-- **mDNS** (`_tasmota._tcp` / `_http._tcp`), and
+- **mDNS** service discovery on your network, and
 - a **subnet sweep** that probes every host on HA's network and keeps the ones that answer like an
   H-Bot device.
 
