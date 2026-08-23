@@ -62,17 +62,53 @@ else
 fi
 
 # The base_url the app would independently DISCOVER this HA at (default: HA's in-network hostname).
-# hbot-connect uses it to safely auto-bind a fresh UNBOUND claim ONLY when the host matches the URL the
-# app discovered (see server.js pickUnboundAutoBind) — this is what makes the true 0-typing flow work
-# for a brand-new client that never told the add-on its home. Overridable for non-default HA ports.
+# hbot-connect uses it as a SECONDARY sanity co-check for the auto-bind (the primary gate is the nonce
+# below). Overridable for non-default HA ports.
 HA_DISCOVER_URL="${HA_DISCOVER_URL:-http://homeassistant:8123}"
 
+# ── LAN proof-of-possession NONCE (true 0-typing auto-bind, hijack-safe) ──────────────────────────────
+# A brand-new client never told the add-on its home, so hbot-connect must decide which unbound claim to
+# bind to the app's home. Host-matching alone is an authorization-bypass (every HAOS advertises
+# http://homeassistant:8123, so a remote attacker could assert it and steal a victim's unbound HA).
+# Instead we mint a 32-byte random NONCE and PUBLISH it as a file HA serves UNAUTHENTICATED on the LAN at
+#   <base_url>/local/hbot_pair_nonce.txt      (HA maps <config>/www/ → /local/, no token required)
+# The app, once it has discovered+reached this HA, GETs that file (proving it is on THIS LAN), and echoes
+# the raw nonce to /claim/pending. hbot-connect binds ONLY if sha256(echo) == the nonce_hash we register
+# here. A non-LAN attacker can neither read the file nor guess 256 bits → cannot forge the proof.
+NONCE_FILE="/data/pair_nonce"
+if [[ -s "$NONCE_FILE" ]]; then
+  NONCE="$(cat "$NONCE_FILE")"
+else
+  NONCE="$(head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')" # 64 hex chars = 256 bits
+  printf '%s' "$NONCE" > "$NONCE_FILE" 2>/dev/null || true
+fi
+NONCE_HASH="$(printf '%s' "$NONCE" | sha256sum | cut -d' ' -f1)"
+
+# Publish the nonce into HA's www/ so it is served at /local/hbot_pair_nonce.txt (no auth). The config dir
+# is mounted at /homeassistant (current) or /config (legacy) via map: homeassistant_config:rw.
+publish_nonce() {
+  local d
+  for d in /homeassistant /config; do
+    if [[ -d "$d" ]]; then
+      mkdir -p "$d/www" 2>/dev/null || true
+      if printf '%s' "$NONCE" > "$d/www/hbot_pair_nonce.txt" 2>/dev/null; then
+        log "published LAN pairing nonce at /local/hbot_pair_nonce.txt (config dir $d)"
+        return 0
+      fi
+    fi
+  done
+  log "WARNING: could not write www/hbot_pair_nonce.txt — 0-tap auto-bind unavailable; visible-code path still works."
+  return 1
+}
+publish_nonce || true
+
 # Register (idempotent per code+ha_id). Non-fatal — retried each boot until the app approves. We declare
-# base_url so the server's host-match gate can auto-bind the single discovered HA with zero typing.
+# base_url (secondary co-check) + nonce_hash (the primary LAN proof gate) so the server can auto-bind the
+# single discovered HA with zero typing, safely.
 register() {
   curl -fsS -X POST "${HBOT_CONNECT_URL}/claim/register" \
     -H 'Content-Type: application/json' \
-    --data "{\"code\":\"${CODE}\",\"ha_id\":\"${HA_ID}\",\"base_url\":\"${HA_DISCOVER_URL}\"}" >/dev/null 2>&1 || return 1
+    --data "{\"code\":\"${CODE}\",\"ha_id\":\"${HA_ID}\",\"base_url\":\"${HA_DISCOVER_URL}\",\"nonce_hash\":\"${NONCE_HASH}\"}" >/dev/null 2>&1 || return 1
 }
 
 if ! register; then
@@ -105,6 +141,8 @@ while [[ $(date +%s) -lt $DEADLINE ]]; do
       printf '%s' "$TOKEN" > "$TOKEN_FILE"
       printf '%s' "$HID" > "$HOME_ID_FILE"
       rm -f "$CODE_FILE"
+      # Pairing done → retire the LAN nonce (remove the served file + cache) so it can't be reused.
+      rm -f "$NONCE_FILE" /homeassistant/www/hbot_pair_nonce.txt /config/www/hbot_pair_nonce.txt 2>/dev/null || true
       log "paired to home ${HID}. Remote access will come up shortly."
       exit 0
     fi
