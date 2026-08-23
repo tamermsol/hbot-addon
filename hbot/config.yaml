@@ -1,5 +1,5 @@
 name: HBot
-version: "1.4.12"
+version: "1.4.13"
 slug: hbot
 description: Bring your H-Bot (Tasmota) devices into Home Assistant over your local network — no cloud. Optional one-tap remote access via a secure Cloudflare tunnel.
 url: https://github.com/tamermsol/hbot-addon

@@ -102,13 +102,50 @@ publish_nonce() {
 }
 publish_nonce || true
 
+# ── Tailscale IP (multi-HA tailnet disambiguation) ───────────────────────────────────────────────────
+# On a tailnet with 2+ HAs both named "homeassistant", the bare MagicDNS name resolves to only ONE box,
+# so the app can't reach THIS operator's HA by name. We detect this box's own Tailscale IPv4 and register
+# it as an explicit tailnet_url; the app then probes it directly (extraTailnetHosts) alongside the bare
+# name and nonce-selects the right one. No tailnet → skip cleanly (LAN-only box, no regression).
+detect_tailnet_ip() {
+  local ip
+  # Preferred: the tailscale CLI (present when Tailscale runs on the host / as an add-on).
+  ip="$(tailscale ip -4 2>/dev/null | head -1 || true)"
+  if [[ -z "$ip" ]]; then
+    # Fallback: the tailscale0 interface address.
+    ip="$(ip -4 addr show tailscale0 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1 || true)"
+  fi
+  if [[ -z "$ip" ]]; then
+    # Last resort: scan all IPv4 addrs for a 100.64.0.0/10 CGNAT address (Tailscale's range).
+    ip="$(ip -4 addr 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' \
+          | awk -F. '$1==100 && $2>=64 && $2<=127 {print; exit}' || true)"
+  fi
+  # Validate it really is a 100.64/10 CGNAT address before trusting it.
+  if [[ "$ip" =~ ^100\.([0-9]+)\. ]] && (( BASH_REMATCH[1] >= 64 && BASH_REMATCH[1] <= 127 )); then
+    printf '%s' "$ip"
+  fi
+}
+TAILNET_IP="$(detect_tailnet_ip)"
+TAILNET_URL=""
+if [[ -n "$TAILNET_IP" ]]; then
+  TAILNET_URL="http://${TAILNET_IP}:8123"
+  log "detected Tailscale IP ${TAILNET_IP} — registering ${TAILNET_URL} so the app finds THIS HA on the tailnet."
+fi
+
 # Register (idempotent per code+ha_id). Non-fatal — retried each boot until the app approves. We declare
 # base_url (secondary co-check) + nonce_hash (the primary LAN proof gate) so the server can auto-bind the
-# single discovered HA with zero typing, safely.
+# single discovered HA with zero typing, safely. tailnet_url (when present) lets the app probe THIS box's
+# tailnet IP directly, past a bare-name collision. Omitted from the body when there is no tailnet.
 register() {
+  local body
+  body="{\"code\":\"${CODE}\",\"ha_id\":\"${HA_ID}\",\"base_url\":\"${HA_DISCOVER_URL}\",\"nonce_hash\":\"${NONCE_HASH}\""
+  if [[ -n "$TAILNET_URL" ]]; then
+    body="${body},\"tailnet_url\":\"${TAILNET_URL}\""
+  fi
+  body="${body}}"
   curl -fsS -X POST "${HBOT_CONNECT_URL}/claim/register" \
     -H 'Content-Type: application/json' \
-    --data "{\"code\":\"${CODE}\",\"ha_id\":\"${HA_ID}\",\"base_url\":\"${HA_DISCOVER_URL}\",\"nonce_hash\":\"${NONCE_HASH}\"}" >/dev/null 2>&1 || return 1
+    --data "$body" >/dev/null 2>&1 || return 1
 }
 
 if ! register; then
