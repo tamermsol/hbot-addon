@@ -61,6 +61,34 @@ else
   printf '%s' "$CODE" > "$CODE_FILE" 2>/dev/null || true
 fi
 
+# ── SELF-HEAL one-shot (v1.4.17) ──────────────────────────────────────────────────────────────────────
+# The approval may have ALREADY happened server-side (e.g. the app approved while a PRIOR poll subshell was
+# torn down by an add-on UPDATE/restart — which is exactly what stranded the operator: claim approved, token
+# ready at /claim/status, but the files were never written so addon-connect.sh never ran). BEFORE we spend
+# 15 min in the register+poll loop, ask the server ONCE with our stable (code, ha_id): if it already says
+# approved, persist the files and exit 0 immediately (paired). This makes a single restart complete pairing.
+persist_if_approved() {
+  local resp status token hid
+  resp="$(curl -fsS -X POST "${HBOT_CONNECT_URL}/claim/status" \
+    -H 'Content-Type: application/json' \
+    --data "{\"code\":\"${CODE}\",\"ha_id\":\"${HA_ID}\"}" 2>/dev/null || echo '')"
+  status="$(echo "$resp" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')"
+  [[ "$status" == "approved" ]] || return 1
+  token="$(echo "$resp" | sed -n 's/.*"provisioning_token":"\([^"]*\)".*/\1/p')"
+  hid="$(echo "$resp" | sed -n 's/.*"home_id":"\([^"]*\)".*/\1/p')"
+  [[ -n "$token" && -n "$hid" ]] || return 1
+  mkdir -p /data
+  printf '%s' "$token" > "$TOKEN_FILE"
+  printf '%s' "$hid" > "$HOME_ID_FILE"
+  rm -f "$CODE_FILE"
+  rm -f "$NONCE_FILE" /homeassistant/www/hbot_pair_nonce.txt /config/www/hbot_pair_nonce.txt 2>/dev/null || true
+  return 0
+}
+if persist_if_approved; then
+  log "self-heal: claim ${CODE} was ALREADY approved server-side — persisted token for home $(cat "$HOME_ID_FILE"). Remote access will come up shortly."
+  exit 0
+fi
+
 # The base_url the app would independently DISCOVER this HA at (default: HA's in-network hostname).
 # hbot-connect uses it as a SECONDARY sanity co-check for the auto-bind (the primary gate is the nonce
 # below). Overridable for non-default HA ports.

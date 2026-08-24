@@ -1,5 +1,5 @@
 name: HBot
-version: "1.4.16"
+version: "1.4.17"
 slug: hbot
 description: Connect your H-Bot smart devices to Home Assistant over your local network — no cloud, no setup. Your lights, panels and shutters appear automatically and work both ways. Optional secure remote access included.
 url: https://github.com/tamermsol/hbot-addon

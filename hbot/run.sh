@@ -60,12 +60,17 @@ if [[ -n "${HBOT_CONNECT_URL:-}" ]]; then
     if [[ ! -s /data/provisioning_token || ! -s /data/home_id ]]; then
       /addon-claim.sh || bashio::log.warning "HBot pairing: claim flow errored — LAN-only for now."
     fi
+    # ALWAYS attempt connect (v1.4.17): do NOT gate solely on the files the claim POLL wrote — that subshell
+    # can die on an add-on update/restart mid-pairing, or the approval can land late, leaving connect skipped
+    # forever even though the server already has the token. addon-connect.sh is now SELF-HEALING: if the
+    # token files are missing but a stable claim_code/ha_id is derivable, it self-fetches the approved token
+    # via /claim/status, then mints + writes ha_connections. It exits 0 cleanly if genuinely unpaired.
     if [[ -s /data/provisioning_token && -s /data/home_id ]]; then
       bashio::log.info "HBot remote access: paired (home $(cat /data/home_id)) — opening Cloudflare tunnel via ${HBOT_CONNECT_URL}"
-      /addon-connect.sh || bashio::log.warning "HBot remote access: tunnel provisioning failed — continuing LAN-only."
     else
-      bashio::log.info "HBot remote access: not paired yet — LAN-only. Pair this HA in the H-Bot app (Settings -> Home Assistant)."
+      bashio::log.info "HBot remote access: not paired via poll — running self-healing connect (fetch approved token if any) via ${HBOT_CONNECT_URL}"
     fi
+    /addon-connect.sh || bashio::log.warning "HBot remote access: connect step failed — continuing LAN-only."
   ) &
 else
   bashio::log.info "HBot remote access: hbot_connect_url unset — LAN-only."

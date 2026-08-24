@@ -21,13 +21,50 @@ set -euo pipefail
 
 HOME_ID_FILE="/data/home_id"
 TOKEN_FILE="/data/provisioning_token"   # per-install token minted in the app at HA-pair time
+HAID_FILE="/data/ha_id"
+CODE_FILE="/data/claim_code"
 STATE_FILE="/data/tunnel_url"
 HBOT_CONNECT_URL="${HBOT_CONNECT_URL:?set HBOT_CONNECT_URL}"
 
-# Not paired yet → nothing to write (prosumer manual-URL path handles it in the app).
+# ── SELF-HEAL (v1.4.17): don't depend on the claim POLL subshell having written the files ──────────────
+# ROOT CAUSE of "approved but nothing happens": addon-claim.sh persisted /data/{home_id,provisioning_token}
+# ONLY inside its 15-min in-process poll. If that subshell died (add-on UPDATE/restart mid-pairing) or the
+# approval landed after the loop, the files were never written → this script's old "not paired → skip" gate
+# skipped connect PERMANENTLY, even though the server already had the token. We now fetch the token
+# OURSELVES from the persisted STABLE (code, ha_id): a single restart completes pairing.
 if [[ ! -s "$HOME_ID_FILE" || ! -s "$TOKEN_FILE" ]]; then
-  echo "[hbot-connect] not paired yet (need home_id + provisioning_token) — skipping."
-  exit 0
+  # Recover the stable ha_id + code the same deterministic way addon-claim.sh derives them (machine-id),
+  # so this works even if /data was partially wiped. A persisted file takes precedence.
+  MID="$(cat /etc/machine-id 2>/dev/null || cat /data/.mid 2>/dev/null || true)"
+  HA_ID="$(cat "$HAID_FILE" 2>/dev/null || true)"
+  [[ -z "$HA_ID" && -n "$MID" ]] && HA_ID="ha-$(printf '%s' "$MID" | sha256sum | cut -c1-24)"
+  CODE="$(cat "$CODE_FILE" 2>/dev/null || true)"
+  [[ -z "$CODE" && -n "$MID" ]] && CODE="HBOT$(printf 'hbot-claim:%s' "$MID" | sha256sum | tr 'a-f' 'A-F' | head -c 8)"
+  if [[ -z "$CODE" || -z "$HA_ID" ]]; then
+    echo "[hbot-connect] not paired yet (no token files and no derivable claim code/ha_id) — skipping."
+    exit 0
+  fi
+  echo "[hbot-connect] token files missing — self-fetching via /claim/status (code ${CODE})…"
+  RESP="$(curl -fsS -m 15 -X POST "${HBOT_CONNECT_URL}/claim/status" \
+    -H 'Content-Type: application/json' \
+    --data "{\"code\":\"${CODE}\",\"ha_id\":\"${HA_ID}\"}" 2>/dev/null || echo '')"
+  STATUS="$(echo "$RESP" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')"
+  if [[ "$STATUS" == "approved" ]]; then
+    T="$(echo "$RESP" | sed -n 's/.*"provisioning_token":"\([^"]*\)".*/\1/p')"
+    H="$(echo "$RESP" | sed -n 's/.*"home_id":"\([^"]*\)".*/\1/p')"
+    if [[ -n "$T" && -n "$H" ]]; then
+      mkdir -p /data
+      printf '%s' "$T" > "$TOKEN_FILE"
+      printf '%s' "$H" > "$HOME_ID_FILE"
+      echo "[hbot-connect] self-heal: fetched approved token for home ${H} — proceeding to mint + connect."
+    else
+      echo "[hbot-connect] /claim/status approved but missing token/home in response — awaiting; exiting 0 (retry next boot)."
+      exit 0
+    fi
+  else
+    echo "[hbot-connect] awaiting approval (status=${STATUS:-none}) — LAN-only for now; a later boot retries."
+    exit 0
+  fi
 fi
 HOME_ID="$(cat "$HOME_ID_FILE")"
 PROV_TOKEN="$(cat "$TOKEN_FILE")"
