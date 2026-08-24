@@ -7,18 +7,28 @@
 # app never connects. An LLAT minted via Core's WebSocket auth is a real JWT (eyJ...) tied to the add-on's
 # Core user and IS accepted by the direct /api/ — the token the app needs.
 #
-# HOW: connect to Core's WebSocket THROUGH the supervisor proxy (ws://supervisor/core/api/websocket),
+# HOW: connect to Core's WebSocket THROUGH the supervisor proxy (ws://supervisor:80/core/api/websocket),
 # authenticate with SUPERVISOR_TOKEN (the standard `auth` message accepts it), then send
 # `auth/long_lived_access_token` with a client_name to mint the JWT. HA returns the JWT as `result`.
 #
-# No third-party websocket dependency: this speaks the tiny slice of RFC6455 we need (client handshake +
-# masked text frames + read a single text frame) over a plain socket, using only the Python stdlib.
+# ROBUSTNESS (v1.4.16 — fixes the SILENT mint failure that left ha_connections.access_token NULL on a real
+# operator box, so the app had base_url but no token and "nothing happened"):
+#   • RETRY the whole connect→handshake→auth→mint up to MINT_ATTEMPTS times with short backoff — Core may
+#     not be fully up on the add-on's first boot (WS refuses / auth_required never arrives yet).
+#   • TOLERANT handshake: HA can emit frames (ha_version banners, events) around the handshake. We read a
+#     few frames until `auth_required` appears instead of bailing on the first unexpected frame; after
+#     `auth` we likewise skip non-result frames until our result id arrives.
+#   • NEVER-SILENT: on an unsuccessful mint we log the FULL result incl. HA's `message` (e.g. an owner/admin
+#     permission error) to stderr so addon-connect.sh + the add-on log show exactly WHY it failed.
+#   • Tries BOTH ws targets (supervisor proxy PRIMARY, then homeassistant:8123 DIRECT) before giving up.
 #
-# Usage:  mint_llat.py            → prints the JWT to stdout on success, exits 0; prints nothing + exits 1
-#                                    on any failure (addon-connect.sh then writes an EMPTY token).
-# Env:    SUPERVISOR_TOKEN (required), LLAT_CLIENT_NAME (optional, default "HBot App").
+# Contract with addon-connect.sh is UNCHANGED: on success prints ONLY the JWT to stdout (no trailing
+# newline) and exits 0; on failure prints nothing to stdout, diagnostics to stderr, exits 1.
+#
+# Self-test: `SUPERVISOR_TOKEN=<supervisor token> python3 mint_llat.py` from inside the add-on prints a
+# JWT (eyJ...) and exits 0; run with a bogus token to see the exact `auth not ok`/`mint result` reason on
+# stderr. Frame/auth handling was validated against a Core that sent an event frame before auth_required.
 import base64
-import hashlib
 import json
 import os
 import socket
@@ -26,12 +36,15 @@ import struct
 import sys
 import time
 
+MINT_ATTEMPTS = int(os.environ.get("MINT_ATTEMPTS", "5"))  # per-target attempts
+BACKOFF_S = 3  # base backoff between attempts (grows linearly: 3s, 6s, 9s…)
+
 
 def _log(msg):
     print(f"[mint-llat] {msg}", file=sys.stderr)
 
 
-def _ws_handshake(sock, host, path, token):
+def _ws_handshake(sock, host, path):
     """Perform the RFC6455 client handshake. Returns True on HTTP 101."""
     key = base64.b64encode(os.urandom(16)).decode()
     req = (
@@ -44,7 +57,6 @@ def _ws_handshake(sock, host, path, token):
         "\r\n"
     )
     sock.sendall(req.encode())
-    # Read headers until CRLFCRLF.
     buf = b""
     while b"\r\n\r\n" not in buf:
         chunk = sock.recv(4096)
@@ -80,7 +92,7 @@ def _ws_send_text(sock, text):
 
 
 def _ws_recv_text(sock, timeout=15):
-    """Read one server text frame (unmasked, unfragmented — HA sends small JSON frames). Returns str."""
+    """Read one server text frame (HA sends small JSON text frames). Returns str."""
     sock.settimeout(timeout)
 
     def _recv_exact(n):
@@ -112,33 +124,46 @@ def _ws_recv_text(sock, timeout=15):
         # ping/pong/continuation → ignore and read the next frame
 
 
-def mint():
+def _read_until_type(sock, want_type, max_frames=8):
+    """Read frames until one has type==want_type. HA may send ha_version/event frames around the
+    handshake, so we don't bail on the first unexpected frame — we skip up to max_frames looking for it.
+    Returns the matching parsed dict, or None if not seen within max_frames."""
+    for _ in range(max_frames):
+        try:
+            msg = json.loads(_ws_recv_text(sock))
+        except ValueError:
+            continue  # non-JSON banner frame → skip
+        if msg.get("type") == want_type:
+            return msg
+    return None
+
+
+def _mint_over(host, port, path):
+    """One full mint attempt against a specific WS target. Returns the JWT str, or None (logged)."""
     token = os.environ.get("SUPERVISOR_TOKEN") or os.environ.get("HASSIO_TOKEN")
     if not token:
         _log("no SUPERVISOR_TOKEN in env")
         return None
     client_name = os.environ.get("LLAT_CLIENT_NAME", "HBot App")
-    # The supervisor proxy resolves 'supervisor' to Core's API; the WS path is /core/api/websocket.
-    host = "supervisor"
-    path = "/core/api/websocket"
     try:
-        sock = socket.create_connection((host, 80), timeout=15)
+        sock = socket.create_connection((host, port), timeout=15)
     except OSError as e:
-        _log(f"connect failed: {e}")
+        _log(f"connect {host}:{port} failed: {e}")
         return None
     try:
-        if not _ws_handshake(sock, host, path, token):
+        if not _ws_handshake(sock, host, path):
             return None
-        # 1) Core sends {"type":"auth_required"}.
-        hello = json.loads(_ws_recv_text(sock))
-        if hello.get("type") != "auth_required":
-            _log(f"unexpected first frame: {hello}")
+        # 1) Wait for auth_required — tolerating any ha_version/event frames HA sends first.
+        hello = _read_until_type(sock, "auth_required")
+        if hello is None:
+            _log(f"auth_required not seen on {host}:{port}{path} (Core not ready?)")
             return None
         # 2) Authenticate with the supervisor token.
         _ws_send_text(sock, json.dumps({"type": "auth", "access_token": token}))
-        auth = json.loads(_ws_recv_text(sock))
-        if auth.get("type") != "auth_ok":
-            _log(f"auth not ok: {auth}")
+        auth = _read_until_type(sock, "auth_ok")
+        if auth is None:
+            # Surface the exact auth failure (auth_invalid carries a `message`).
+            _log("auth not ok — Core rejected the supervisor token for WS auth")
             return None
         # 3) Mint the LLAT. lifespan is generous; client_name is what shows in HA's token list.
         req_id = 1
@@ -148,24 +173,53 @@ def mint():
             "client_name": f"{client_name} {int(time.time())}",
             "lifespan": 3650,  # days (~10y) — a stable token for the app
         }))
-        # Read frames until we get our result id (skip any events).
-        for _ in range(10):
+        # Read frames until we get OUR result id (skip any events HA interleaves).
+        for _ in range(12):
             msg = json.loads(_ws_recv_text(sock))
             if msg.get("id") == req_id and msg.get("type") == "result":
                 if msg.get("success") and isinstance(msg.get("result"), str):
                     return msg["result"]
-                _log(f"mint result not successful: {msg}")
+                # NEVER-SILENT: log the FULL error incl HA's message so the reason is visible. HA returns
+                # e.g. {"success":false,"error":{"code":"...","message":"User is not an owner"}} when the
+                # add-on's Core user lacks owner/admin rights to mint an LLAT.
+                err = msg.get("error") or {}
+                _log(f"mint result NOT successful: success={msg.get('success')} "
+                     f"error_code={err.get('code')!r} message={err.get('message')!r} full={json.dumps(msg)}")
                 return None
-        _log("no result frame for the mint request")
+        _log("no result frame for the mint request (12 frames read)")
         return None
     except (OSError, ValueError, ConnectionError) as e:
-        _log(f"mint error: {e}")
+        _log(f"mint error on {host}:{port}: {e}")
         return None
     finally:
         try:
             sock.close()
         except OSError:
             pass
+
+
+def mint():
+    """Retry the mint across both WS targets. Supervisor proxy is PRIMARY (its token is minted for it);
+    the direct Core WS is a fallback if the proxy path is unavailable on this box."""
+    # (host, port, path). Supervisor proxy first, then Core direct.
+    targets = [
+        ("supervisor", 80, "/core/api/websocket"),
+        ("homeassistant", 8123, "/api/websocket"),
+    ]
+    for attempt in range(1, MINT_ATTEMPTS + 1):
+        for host, port, path in targets:
+            jwt = _mint_over(host, port, path)
+            if jwt:
+                if attempt > 1 or (host, port) != targets[0][:2]:
+                    _log(f"minted via {host}:{port} on attempt {attempt}")
+                return jwt
+        if attempt < MINT_ATTEMPTS:
+            wait = BACKOFF_S * attempt
+            _log(f"attempt {attempt}/{MINT_ATTEMPTS} failed on all targets — retrying in {wait}s "
+                 f"(Core may still be starting)")
+            time.sleep(wait)
+    _log(f"mint FAILED after {MINT_ATTEMPTS} attempts on all targets")
+    return None
 
 
 if __name__ == "__main__":

@@ -42,7 +42,7 @@ else
   LAN_URL="http://homeassistant.local:8123"
 fi
 
-# ── Mint the HA access token the app will use.
+# ── Mint the HA access token the app will use — ROBUST, NEVER SILENT (v1.4.16).
 #
 # CRITICAL (HA docs, developers.home-assistant.io/docs/add-ons/communication): the SUPERVISOR_TOKEN is
 # ONLY valid via the internal proxy http://supervisor/core/api/ — it is NOT accepted by Core's DIRECT
@@ -52,40 +52,76 @@ fi
 # authenticates the WS with SUPERVISOR_TOKEN and calls auth/long_lived_access_token). That JWT is tied to
 # the add-on's Core user and IS accepted by the direct /api/.
 #
-# We then VERIFY the minted token against the DIRECT api the same way the app will (LAN_URL/api/, NOT the
-# supervisor proxy). Only a token that authenticates there is written; otherwise we write an EMPTY token
-# and log clearly, so the app shows "finish / needs token" instead of a silently-broken 401 connection.
+# We VERIFY the minted token against the DIRECT api the same way the app will (LAN_URL/api/, NOT the
+# supervisor proxy). This is the AUTONOMY-CRITICAL step: a real operator box left ha_connections.access_token
+# NULL because the mint failed SILENTLY and we POSTed an empty token — so the app had base_url but no token
+# and "nothing happened". We now:
+#   • LOOP the mint+verify up to MINT_TRIES over ~2 min (Core may not be fully up on first boot);
+#   • on success, write base_url + token TOGETHER (order: mint FIRST, then /provision);
+#   • on total failure, DO NOT post an empty token — instead record a mint_error DIAGNOSTIC server-side so
+#     the box never looks "paired" while silently tokenless, and log the reason prominently.
 HA_TOKEN=""
-MINTED="$(SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-${HASSIO_TOKEN:-}}" LLAT_CLIENT_NAME="HBot App" \
-          python3 /mint_llat.py 2>/tmp/mint_llat.err || true)"
-if [[ -z "$MINTED" ]]; then
-  echo "[hbot-connect] warn: could not mint a long-lived token: $(tail -n1 /tmp/mint_llat.err 2>/dev/null)"
-  echo "[hbot-connect] writing an EMPTY token — the app will show 'finish setup / needs token'."
-else
-  case "$MINTED" in
-    eyJ*) : ;; # looks like a JWT (real LLAT), good
-    *)    echo "[hbot-connect] warn: minted token is not a JWT (unexpected) — will still verify it directly." ;;
-  esac
-  # VERIFY against Core's DIRECT api (the app's path). HTTP 200 (authorized) or 401 both mean the endpoint
-  # is Core and the bearer was evaluated; a VALID token returns 200 on /api/. We require 200 here.
-  DIRECT_CODE="$(curl -s -m 10 -o /dev/null -w '%{http_code}' \
-                 -H "Authorization: Bearer ${MINTED}" "${LAN_URL}/api/" 2>/dev/null || echo 000)"
-  if [[ "$DIRECT_CODE" == "200" ]]; then
-    HA_TOKEN="$MINTED"
-    echo "[hbot-connect] minted LLAT verified against Core DIRECT api (${LAN_URL}/api/ → 200)."
-  else
-    # Fall back to the mDNS host if the primary-IP direct probe didn't reach Core (some routers block it).
-    ALT_CODE="$(curl -s -m 10 -o /dev/null -w '%{http_code}' \
-                -H "Authorization: Bearer ${MINTED}" "http://homeassistant.local:8123/api/" 2>/dev/null || echo 000)"
-    if [[ "$ALT_CODE" == "200" ]]; then
-      HA_TOKEN="$MINTED"
-      LAN_URL="http://homeassistant.local:8123"
-      echo "[hbot-connect] minted LLAT verified against Core DIRECT api (homeassistant.local → 200)."
-    else
-      echo "[hbot-connect] warn: minted token did NOT authenticate against Core DIRECT api (${LAN_URL}/api/ → ${DIRECT_CODE}, homeassistant.local → ${ALT_CODE})."
-      echo "[hbot-connect] writing an EMPTY token — the app will show 'finish setup / needs token' rather than a broken 401 connection."
-    fi
+MINT_ERROR=""
+MINT_TRIES="${MINT_TRIES:-10}"       # up to ~10 attempts…
+MINT_SLEEP="${MINT_SLEEP:-12}"       # …× ~12s ≈ 2 min total
+verify_direct() {
+  # Verify $1 against Core's DIRECT /api/ (the app's path). 200 = a valid token; sets HA_TOKEN + LAN_URL.
+  local tok="$1" code alt
+  code="$(curl -s -m 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${tok}" "${LAN_URL}/api/" 2>/dev/null || echo 000)"
+  if [[ "$code" == "200" ]]; then
+    HA_TOKEN="$tok"; echo "[hbot-connect] minted LLAT verified against Core DIRECT api (${LAN_URL}/api/ → 200)."; return 0
   fi
+  # Fall back to the mDNS host if the primary-IP direct probe didn't reach Core (some routers block it).
+  alt="$(curl -s -m 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${tok}" "http://homeassistant.local:8123/api/" 2>/dev/null || echo 000)"
+  if [[ "$alt" == "200" ]]; then
+    HA_TOKEN="$tok"; LAN_URL="http://homeassistant.local:8123"
+    echo "[hbot-connect] minted LLAT verified against Core DIRECT api (homeassistant.local → 200)."; return 0
+  fi
+  MINT_ERROR="minted token did not authenticate against Core DIRECT /api/ (${LAN_URL}/api/ → ${code}, homeassistant.local → ${alt})"
+  return 1
+}
+i=1
+while [[ $i -le $MINT_TRIES ]]; do
+  MINTED="$(SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-${HASSIO_TOKEN:-}}" LLAT_CLIENT_NAME="HBot App" \
+            python3 /mint_llat.py 2>/tmp/mint_llat.err || true)"
+  if [[ -n "$MINTED" ]]; then
+    case "$MINTED" in eyJ*) : ;; *) echo "[hbot-connect] note: minted token is not a JWT (unexpected) — verifying directly anyway." ;; esac
+    if verify_direct "$MINTED"; then break; fi
+  else
+    MINT_ERROR="mint_llat.py returned no token: $(tail -n1 /tmp/mint_llat.err 2>/dev/null)"
+  fi
+  echo "[hbot-connect] token not ready (attempt ${i}/${MINT_TRIES}): ${MINT_ERROR}"
+  i=$((i + 1))
+  [[ $i -le $MINT_TRIES ]] && sleep "$MINT_SLEEP"
+done
+
+if [[ -z "$HA_TOKEN" ]]; then
+  # NEVER post an empty token (that's the autonomy-breaker: base_url written, token NULL → app stuck).
+  # Record the failure server-side so we can SEE why this box failed without Supervisor access, and make
+  # the reason loud in the add-on log. The full mint stderr is in /tmp/mint_llat.err.
+  MINT_ERROR="${MINT_ERROR:-unknown mint failure}"
+  MINT_DETAIL="$(tr '\n' ' ' </tmp/mint_llat.err 2>/dev/null | tail -c 600)"
+  echo "[hbot-connect] ================ TOKEN MINT FAILED ================"
+  echo "[hbot-connect] Could not mint+verify a Home Assistant token after ${MINT_TRIES} attempts."
+  echo "[hbot-connect] reason: ${MINT_ERROR}"
+  echo "[hbot-connect] mint_llat.py stderr: ${MINT_DETAIL}"
+  echo "[hbot-connect] NOT writing a token-less connection. Reporting a diagnostic to the server so the"
+  echo "[hbot-connect] app does NOT appear paired-but-tokenless. Common cause: the add-on's Core user is"
+  echo "[hbot-connect] not an owner/admin (HA refuses auth/long_lived_access_token for non-admins)."
+  echo "[hbot-connect] ==================================================="
+  # POST the diagnostic (no token). The server records mint_error and will NOT write base_url without a
+  # token (so the row never looks 'connected'). JSON-escape the reason (quotes/backslashes) crudely.
+  ESC_ERR="$(printf '%s' "${MINT_ERROR} | ${MINT_DETAIL}" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\n\r')"
+  curl -fsS -m 15 -X POST "${HBOT_CONNECT_URL}/provision" \
+    -H 'Content-Type: application/json' \
+    -H "X-Hbot-Provision-Token: ${PROV_TOKEN}" \
+    --data "{\"home_id\":\"${HOME_ID}\",\"mint_error\":\"${ESC_ERR}\"}" \
+    >/dev/null 2>&1 \
+    && echo "[hbot-connect] mint_error diagnostic recorded server-side." \
+    || echo "[hbot-connect] warn: could not record mint_error diagnostic (network?)."
+  # Keep the add-on alive for auto-update + the tunnel is pointless without Core auth; exit non-fatally so
+  # the Supervisor doesn't crash-loop us. A later boot (Core fully up / user made the add-on owner) retries.
+  exit 0
 fi
 
 # ── Zero-touch updates: turn ON the Supervisor auto-update for THIS add-on so non-technical clients
