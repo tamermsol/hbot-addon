@@ -79,15 +79,17 @@ else
   LAN_URL="http://homeassistant.local:8123"
 fi
 
-# ── Mint the HA access token the app will use — ROBUST, NEVER SILENT (v1.4.16).
+# ── Mint the HA access token the app will use — ROBUST, NEVER SILENT (v1.4.16), NON-SYSTEM USER (v1.4.18).
 #
-# CRITICAL (HA docs, developers.home-assistant.io/docs/add-ons/communication): the SUPERVISOR_TOKEN is
-# ONLY valid via the internal proxy http://supervisor/core/api/ — it is NOT accepted by Core's DIRECT
-# external API at homeassistant.local:8123/api/, which is exactly what the phone app calls. Writing it as
-# the app's access_token therefore yields a 401 and the app never connects (even after restart). So we
-# MINT A REAL long-lived access token (LLAT, a JWT eyJ...) via Core's WebSocket auth (mint_llat.py, which
-# authenticates the WS with SUPERVISOR_TOKEN and calls auth/long_lived_access_token). That JWT is tied to
-# the add-on's Core user and IS accepted by the direct /api/.
+# CRITICAL (HA docs): the SUPERVISOR_TOKEN is ONLY valid via the internal proxy http://supervisor/core/api/
+# — NOT accepted by Core's DIRECT external API at homeassistant.local:8123/api/, which is what the phone app
+# calls. Writing it as access_token yields 401.
+#
+# v1.4.18 PIVOT (the LLAT-as-supervisor mint was a source-proven DEAD END: the supervisor's Core user is
+# system_generated, and HA refuses auth/long_lived_access_token for a system user → {"code":"unknown_error"}).
+# mint_llat.py now, over the supervisor proxy WS (admin identity), CREATES a dedicated NON-system HA user +
+# login credential, logs in AS that user, and mints an LLAT AS THAT USER — which HA permits. That JWT is a
+# real Core token accepted by the direct /api/. mint_llat.py still prints ONLY the JWT to stdout on success.
 #
 # We VERIFY the minted token against the DIRECT api the same way the app will (LAN_URL/api/, NOT the
 # supervisor proxy). This is the AUTONOMY-CRITICAL step: a real operator box left ha_connections.access_token
@@ -119,7 +121,10 @@ verify_direct() {
 }
 i=1
 while [[ $i -le $MINT_TRIES ]]; do
-  MINTED="$(SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-${HASSIO_TOKEN:-}}" LLAT_CLIENT_NAME="HBot App" \
+  # MINT_ATTEMPTS=1: this OUTER loop owns the retry cadence (MINT_SLEEP between tries). mint_llat.py now
+  # also creates a dedicated non-system user (idempotent) + logs in as it to mint a REAL LLAT, so one inner
+  # attempt per outer tick keeps total time bounded (~2 min) while Core finishes starting.
+  MINTED="$(MINT_ATTEMPTS=1 SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-${HASSIO_TOKEN:-}}" LLAT_CLIENT_NAME="HBot App" \
             python3 /mint_llat.py 2>/tmp/mint_llat.err || true)"
   if [[ -n "$MINTED" ]]; then
     case "$MINTED" in eyJ*) : ;; *) echo "[hbot-connect] note: minted token is not a JWT (unexpected) — verifying directly anyway." ;; esac

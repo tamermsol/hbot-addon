@@ -1,33 +1,47 @@
 #!/usr/bin/env python3
-# mint_llat.py — mint a REAL Home Assistant Long-Lived Access Token (LLAT) from inside the add-on.
+# mint_llat.py — obtain a REAL Home Assistant Long-Lived Access Token (LLAT) the phone app can use against
+# Core's DIRECT api, FULLY AUTONOMOUSLY (zero operator typing) from inside the add-on.
 #
-# WHY: the SUPERVISOR_TOKEN authenticates ONLY against the internal proxy (http://supervisor/core/api/).
-# It is NOT valid against Core's DIRECT external API (homeassistant.local:8123/api/), which is exactly
-# what the phone app calls — so writing SUPERVISOR_TOKEN as the app's access_token yields a 401 and the
-# app never connects. An LLAT minted via Core's WebSocket auth is a real JWT (eyJ...) tied to the add-on's
-# Core user and IS accepted by the direct /api/ — the token the app needs.
+# ═══ WHY THE OLD APPROACH WAS A DEAD END (source-proven) ═══
+# The prior version authenticated the Core WebSocket with SUPERVISOR_TOKEN and called
+# `auth/long_lived_access_token`. That WS runs as the Supervisor's Core user, which is created
+# system_generated=True (core/components/hassio: async_create_system_user(HASSIO_USER_NAME,
+# group_ids=[GROUP_ID_ADMIN])). Core's auth manager REFUSES an LLAT for a system user:
+#   async_create_refresh_token: `if user.system_generated != (token_type == TOKEN_TYPE_SYSTEM): raise`
+# → the WS command surfaces the generic {"code":"unknown_error"} we saw on the operator's box. An add-on
+# can NEVER mint an LLAT as the supervisor identity. Confirmed against home-assistant/core dev.
 #
-# HOW: connect to Core's WebSocket THROUGH the supervisor proxy (ws://supervisor:80/core/api/websocket),
-# authenticate with SUPERVISOR_TOKEN (the standard `auth` message accepts it), then send
-# `auth/long_lived_access_token` with a client_name to mint the JWT. HA returns the JWT as `result`.
+# ═══ THE WORKING APPROACH — OPTION A: a DEDICATED NON-SYSTEM user + its LLAT ═══
+# The Supervisor's Core user is system_generated BUT **admin** (group_ids=[GROUP_ID_ADMIN]). Admin is all
+# that Core's user-admin WS commands require (each is @websocket_api.require_admin, which checks
+# user.is_admin — the supervisor user passes). So over the supervisor proxy WS we:
+#   1. config/auth/create {name, group_ids:[system-admin group]}  → creates a NORMAL (non-system) user.
+#      (core/components/config/auth.py::websocket_create → async_create_user → NOT system_generated.)
+#   2. config/auth_provider/homeassistant/create {user_id, username, password}  → attaches a login
+#      credential (core/components/config/auth_provider_homeassistant.py::websocket_create →
+#      provider.async_add_auth).
+#   3. Log in AS THAT USER via the standard OAuth/IndieAuth login_flow (username+password) → an auth code
+#      → POST /auth/token grant_type=authorization_code → a refresh_token + access_token for the NEW user.
+#   4. Open a fresh Core WS, auth with that access_token (now we ARE the non-system user), and call
+#      auth/long_lived_access_token → SUCCEEDS (the system-user guard does not apply). Return that JWT.
+# A non-system user CAN own an LLAT — that is exactly why ours failed and this one works.
 #
-# ROBUSTNESS (v1.4.16 — fixes the SILENT mint failure that left ha_connections.access_token NULL on a real
-# operator box, so the app had base_url but no token and "nothing happened"):
-#   • RETRY the whole connect→handshake→auth→mint up to MINT_ATTEMPTS times with short backoff — Core may
-#     not be fully up on the add-on's first boot (WS refuses / auth_required never arrives yet).
-#   • TOLERANT handshake: HA can emit frames (ha_version banners, events) around the handshake. We read a
-#     few frames until `auth_required` appears instead of bailing on the first unexpected frame; after
-#     `auth` we likewise skip non-result frames until our result id arrives.
-#   • NEVER-SILENT: on an unsuccessful mint we log the FULL result incl. HA's `message` (e.g. an owner/admin
-#     permission error) to stderr so addon-connect.sh + the add-on log show exactly WHY it failed.
-#   • Tries BOTH ws targets (supervisor proxy PRIMARY, then homeassistant:8123 DIRECT) before giving up.
+# IndieAuth note: login_flow verifies client_id/redirect_uri (core/components/auth/indieauth.py). It accepts
+# same-scheme+same-domain client_id==redirect_uri, and _parse_client_id rejects IPv4 EXCEPT 127.0.0.1. So we
+# drive the login flow against http://127.0.0.1:8123 with client_id==redirect_uri==that origin (the add-on
+# runs host_network, so 127.0.0.1:8123 reaches Core). The MINTED LLAT is user-scoped, not origin-scoped, so
+# it is valid on the app's own base_url/api/ afterwards.
 #
-# Contract with addon-connect.sh is UNCHANGED: on success prints ONLY the JWT to stdout (no trailing
-# newline) and exits 0; on failure prints nothing to stdout, diagnostics to stderr, exits 1.
+# Idempotent: the created username/password are persisted at /data/{hbot_user,hbot_pass}. On re-run we reuse
+# them (re-login + re-mint) instead of creating a second user. client_name for the LLAT is unique per mint
+# (Core rejects a duplicate client_name), so re-mints just add a fresh token for the same user.
 #
-# Self-test: `SUPERVISOR_TOKEN=<supervisor token> python3 mint_llat.py` from inside the add-on prints a
-# JWT (eyJ...) and exits 0; run with a bogus token to see the exact `auth not ok`/`mint result` reason on
-# stderr. Frame/auth handling was validated against a Core that sent an event frame before auth_required.
+# Contract with addon-connect.sh is UNCHANGED: prints ONLY the JWT to stdout (no trailing newline), exit 0
+# on success; nothing to stdout + diagnostics to stderr + exit 1 on failure.
+#
+# Self-test: `SUPERVISOR_TOKEN=<token> python3 mint_llat.py` inside the add-on prints eyJ... and exit 0; the
+# created user "HBot App" appears under Settings → People (system-managed). Failures print the exact Core
+# error (create/login/token/mint) to stderr, which addon-connect.sh records as mint_error server-side.
 import base64
 import json
 import os
@@ -35,26 +49,28 @@ import socket
 import struct
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
-MINT_ATTEMPTS = int(os.environ.get("MINT_ATTEMPTS", "5"))  # per-target attempts
-BACKOFF_S = 3  # base backoff between attempts (grows linearly: 3s, 6s, 9s…)
+MINT_ATTEMPTS = int(os.environ.get("MINT_ATTEMPTS", "5"))
+BACKOFF_S = 3
+
+USER_FILE = "/data/hbot_user"
+PASS_FILE = "/data/hbot_pass"
+HBOT_USER_NAME = "HBot App"  # display name in Settings → People
 
 
 def _log(msg):
     print(f"[mint-llat] {msg}", file=sys.stderr)
 
 
+# ── tiny RFC6455 client (unchanged primitives) ──────────────────────────────────────────────────────────
 def _ws_handshake(sock, host, path):
-    """Perform the RFC6455 client handshake. Returns True on HTTP 101."""
     key = base64.b64encode(os.urandom(16)).decode()
     req = (
-        f"GET {path} HTTP/1.1\r\n"
-        f"Host: {host}\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        f"Sec-WebSocket-Key: {key}\r\n"
-        "Sec-WebSocket-Version: 13\r\n"
-        "\r\n"
+        f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
+        f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
     )
     sock.sendall(req.encode())
     buf = b""
@@ -72,10 +88,9 @@ def _ws_handshake(sock, host, path):
     return True
 
 
-def _ws_send_text(sock, text):
-    """Send one masked text frame (client frames MUST be masked)."""
-    payload = text.encode()
-    header = bytearray([0x81])  # FIN + text opcode
+def _ws_send(sock, obj):
+    payload = json.dumps(obj).encode()
+    header = bytearray([0x81])
     n = len(payload)
     if n < 126:
         header.append(0x80 | n)
@@ -91,11 +106,10 @@ def _ws_send_text(sock, text):
     sock.sendall(bytes(header) + masked)
 
 
-def _ws_recv_text(sock, timeout=15):
-    """Read one server text frame (HA sends small JSON text frames). Returns str."""
+def _ws_recv(sock, timeout=15):
     sock.settimeout(timeout)
 
-    def _recv_exact(n):
+    def _exact(n):
         data = b""
         while len(data) < n:
             chunk = sock.recv(n - len(data))
@@ -105,126 +119,252 @@ def _ws_recv_text(sock, timeout=15):
         return data
 
     while True:
-        b0, b1 = _recv_exact(2)
+        b0, b1 = _exact(2)
         opcode = b0 & 0x0F
         masked = (b1 & 0x80) != 0
         length = b1 & 0x7F
         if length == 126:
-            length = struct.unpack(">H", _recv_exact(2))[0]
+            length = struct.unpack(">H", _exact(2))[0]
         elif length == 127:
-            length = struct.unpack(">Q", _recv_exact(8))[0]
-        mask = _recv_exact(4) if masked else b""
-        payload = _recv_exact(length) if length else b""
+            length = struct.unpack(">Q", _exact(8))[0]
+        mask = _exact(4) if masked else b""
+        payload = _exact(length) if length else b""
         if masked:
             payload = bytes(c ^ mask[i % 4] for i, c in enumerate(payload))
-        if opcode == 0x8:  # close
+        if opcode == 0x8:
             raise ConnectionError("server closed the websocket")
-        if opcode in (0x1, 0x2):  # text / binary
-            return payload.decode(errors="replace")
-        # ping/pong/continuation → ignore and read the next frame
+        if opcode in (0x1, 0x2):
+            return json.loads(payload.decode(errors="replace"))
 
 
 def _read_until_type(sock, want_type, max_frames=8):
-    """Read frames until one has type==want_type. HA may send ha_version/event frames around the
-    handshake, so we don't bail on the first unexpected frame — we skip up to max_frames looking for it.
-    Returns the matching parsed dict, or None if not seen within max_frames."""
     for _ in range(max_frames):
         try:
-            msg = json.loads(_ws_recv_text(sock))
+            msg = _ws_recv(sock)
         except ValueError:
-            continue  # non-JSON banner frame → skip
+            continue
         if msg.get("type") == want_type:
             return msg
     return None
 
 
-def _mint_over(host, port, path):
-    """One full mint attempt against a specific WS target. Returns the JWT str, or None (logged)."""
-    token = os.environ.get("SUPERVISOR_TOKEN") or os.environ.get("HASSIO_TOKEN")
-    if not token:
-        _log("no SUPERVISOR_TOKEN in env")
-        return None
-    client_name = os.environ.get("LLAT_CLIENT_NAME", "HBot App")
-    try:
-        sock = socket.create_connection((host, port), timeout=15)
-    except OSError as e:
-        _log(f"connect {host}:{port} failed: {e}")
-        return None
-    try:
-        if not _ws_handshake(sock, host, path):
-            return None
-        # 1) Wait for auth_required — tolerating any ha_version/event frames HA sends first.
-        hello = _read_until_type(sock, "auth_required")
-        if hello is None:
-            _log(f"auth_required not seen on {host}:{port}{path} (Core not ready?)")
-            return None
-        # 2) Authenticate with the supervisor token.
-        _ws_send_text(sock, json.dumps({"type": "auth", "access_token": token}))
-        auth = _read_until_type(sock, "auth_ok")
-        if auth is None:
-            # Surface the exact auth failure (auth_invalid carries a `message`).
-            _log("auth not ok — Core rejected the supervisor token for WS auth")
-            return None
-        # 3) Mint the LLAT. lifespan is generous; client_name is what shows in HA's token list.
-        req_id = 1
-        _ws_send_text(sock, json.dumps({
-            "id": req_id,
-            "type": "auth/long_lived_access_token",
-            "client_name": f"{client_name} {int(time.time())}",
-            "lifespan": 3650,  # days (~10y) — a stable token for the app
-        }))
-        # Read frames until we get OUR result id (skip any events HA interleaves).
+class WS:
+    """An authenticated Core WS session (admin, via the supervisor proxy). Sends commands with auto ids and
+    returns the matching result frame (skipping events)."""
+
+    def __init__(self, host, port, path, access_token):
+        self.sock = socket.create_connection((host, port), timeout=15)
+        self._id = 0
+        if not _ws_handshake(self.sock, host, path):
+            raise ConnectionError("ws handshake failed")
+        if _read_until_type(self.sock, "auth_required") is None:
+            raise ConnectionError("auth_required not seen")
+        _ws_send(self.sock, {"type": "auth", "access_token": access_token})
+        if _read_until_type(self.sock, "auth_ok") is None:
+            raise ConnectionError("auth not ok")
+
+    def cmd(self, obj):
+        self._id += 1
+        obj = {**obj, "id": self._id}
+        _ws_send(self.sock, obj)
         for _ in range(12):
-            msg = json.loads(_ws_recv_text(sock))
-            if msg.get("id") == req_id and msg.get("type") == "result":
-                if msg.get("success") and isinstance(msg.get("result"), str):
-                    return msg["result"]
-                # NEVER-SILENT: log the FULL error incl HA's message so the reason is visible. HA returns
-                # e.g. {"success":false,"error":{"code":"...","message":"User is not an owner"}} when the
-                # add-on's Core user lacks owner/admin rights to mint an LLAT.
-                err = msg.get("error") or {}
-                _log(f"mint result NOT successful: success={msg.get('success')} "
-                     f"error_code={err.get('code')!r} message={err.get('message')!r} full={json.dumps(msg)}")
-                return None
-        _log("no result frame for the mint request (12 frames read)")
-        return None
-    except (OSError, ValueError, ConnectionError) as e:
-        _log(f"mint error on {host}:{port}: {e}")
-        return None
-    finally:
+            msg = _ws_recv(self.sock)
+            if msg.get("id") == self._id and msg.get("type") == "result":
+                return msg
+        raise ConnectionError(f"no result for {obj.get('type')}")
+
+    def close(self):
         try:
-            sock.close()
+            self.sock.close()
         except OSError:
             pass
 
 
+# ── HTTP helper (login_flow + token exchange) ────────────────────────────────────────────────────────────
+def _http(method, url, body=None, headers=None, timeout=15):
+    data = None
+    hdrs = dict(headers or {})
+    if body is not None:
+        data = json.dumps(body).encode()
+        hdrs["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            txt = r.read().decode(errors="replace")
+            return r.getcode(), (json.loads(txt) if txt.strip() else {})
+    except urllib.error.HTTPError as e:
+        txt = e.read().decode(errors="replace")
+        try:
+            return e.code, json.loads(txt)
+        except ValueError:
+            return e.code, {"_raw": txt}
+
+
+def _load_or_make_creds():
+    user = None
+    pw = None
+    try:
+        if os.path.exists(USER_FILE):
+            user = open(USER_FILE).read().strip() or None
+        if os.path.exists(PASS_FILE):
+            pw = open(PASS_FILE).read().strip() or None
+    except OSError:
+        pass
+    if not user:
+        user = "hbot_app_" + base64.b32encode(os.urandom(5)).decode().lower().rstrip("=")
+    if not pw:
+        pw = base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip("=")
+    try:
+        os.makedirs("/data", exist_ok=True)
+        with open(USER_FILE, "w") as f:
+            f.write(user)
+        os.chmod(USER_FILE, 0o600)
+        with open(PASS_FILE, "w") as f:
+            f.write(pw)
+        os.chmod(PASS_FILE, 0o600)
+    except OSError:
+        pass
+    return user, pw
+
+
+def _admin_group_id(ws):
+    """Return Core's system admin group id (usually 'system-admin'). Read config/auth/list is admin-only;
+    instead we use the well-known constant, falling back if a create rejects it."""
+    return "system-admin"  # homeassistant.auth.const.GROUP_ID_ADMIN
+
+
+def _ensure_user_and_credentials(ws, username, password):
+    """Create (idempotently) a NON-system admin user + a homeassistant-provider login credential. Returns
+    the user_id. Reuses an existing user with the same name if present (so re-runs don't pile up users)."""
+    # Is a user with our name already present? (config/auth/list is admin-only; the supervisor user is admin.)
+    listing = ws.cmd({"type": "config/auth/list"})
+    uid = None
+    if listing.get("success"):
+        for u in listing.get("result", []):
+            if u.get("name") == HBOT_USER_NAME and not u.get("system_generated"):
+                uid = u.get("id")
+                break
+    if not uid:
+        res = ws.cmd({"type": "config/auth/create", "name": HBOT_USER_NAME,
+                      "group_ids": [_admin_group_id(ws)]})
+        if not res.get("success"):
+            raise RuntimeError(f"config/auth/create failed: {json.dumps(res.get('error'))}")
+        uid = res["result"]["user"]["id"]
+        _log(f"created non-system user {HBOT_USER_NAME} ({uid})")
+    # (Re)attach the login credential. If it already exists Core errors; ignore that and proceed to login.
+    cred = ws.cmd({"type": "config/auth_provider/homeassistant/create",
+                   "user_id": uid, "username": username, "password": password})
+    if not cred.get("success"):
+        err = json.dumps(cred.get("error"))
+        # A pre-existing credential for this username is fine — we still know the password (persisted).
+        _log(f"credential create note (continuing, may already exist): {err}")
+    return uid
+
+
+def _login_and_get_access_token(origin, username, password):
+    """Drive the OAuth/IndieAuth login_flow as the new user → authorization_code → access_token.
+    origin MUST be a hostname/127.0.0.1 URL (IndieAuth rejects other IPv4). client_id==redirect_uri==origin
+    (same scheme+domain → verify_redirect_uri passes)."""
+    client_id = origin + "/"
+    redirect_uri = origin + "/"
+    # 1) start a login flow for the homeassistant provider.
+    code, start = _http("POST", f"{origin}/auth/login_flow",
+                        {"client_id": client_id, "redirect_uri": redirect_uri,
+                         "handler": ["homeassistant", None]})
+    if code != 200 or "flow_id" not in start:
+        raise RuntimeError(f"login_flow start failed ({code}): {json.dumps(start)}")
+    flow_id = start["flow_id"]
+    # 2) submit credentials.
+    code, step = _http("POST", f"{origin}/auth/login_flow/{flow_id}",
+                       {"client_id": client_id, "username": username, "password": password})
+    if code != 200:
+        raise RuntimeError(f"login_flow step failed ({code}): {json.dumps(step)}")
+    if step.get("type") != "create_entry" or not step.get("result"):
+        raise RuntimeError(f"login did not create an entry: {json.dumps(step)}")
+    auth_code = step["result"]
+    # 3) exchange the auth code for tokens (form-encoded, per the OAuth token endpoint).
+    form = f"client_id={urllib.parse.quote(client_id, safe='')}&grant_type=authorization_code&code={urllib.parse.quote(auth_code, safe='')}"
+    req = urllib.request.Request(f"{origin}/auth/token", data=form.encode(),
+                                 headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            tok = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"/auth/token failed ({e.code}): {e.read().decode(errors='replace')}")
+    at = tok.get("access_token")
+    if not at:
+        raise RuntimeError(f"/auth/token returned no access_token: {json.dumps(tok)}")
+    return at
+
+
+def _mint_llat_as_user(origin_host, origin_port, user_access_token):
+    """Open a Core WS AS THE NEW USER (its access token) and mint an LLAT — succeeds (non-system user)."""
+    ws = WS(origin_host, origin_port, "/api/websocket", user_access_token)
+    try:
+        res = ws.cmd({"type": "auth/long_lived_access_token",
+                      "client_name": f"HBot App {int(time.time())}", "lifespan": 3650})
+        if res.get("success") and isinstance(res.get("result"), str):
+            return res["result"]
+        err = res.get("error") or {}
+        raise RuntimeError(f"LLAT mint (as new user) failed: code={err.get('code')!r} "
+                           f"message={err.get('message')!r} full={json.dumps(res)}")
+    finally:
+        ws.close()
+
+
+def _attempt():
+    sup = os.environ.get("SUPERVISOR_TOKEN") or os.environ.get("HASSIO_TOKEN")
+    if not sup:
+        _log("no SUPERVISOR_TOKEN in env")
+        return None
+    username, password = _load_or_make_creds()
+    # 1+2) create the non-system user + credential over the supervisor proxy WS (admin identity).
+    admin_ws = WS("supervisor", 80, "/core/api/websocket", sup)
+    try:
+        _ensure_user_and_credentials(admin_ws, username, password)
+    finally:
+        admin_ws.close()
+    # 3) login AS that user against a hostname/127.0.0.1 origin (IndieAuth-legal) to get an access token.
+    #    Try 127.0.0.1 first (host_network reaches Core), then the mDNS hostname.
+    last_err = None
+    for origin, mint_host, mint_port in (
+        ("http://127.0.0.1:8123", "127.0.0.1", 8123),
+        ("http://homeassistant.local:8123", "homeassistant.local", 8123),
+    ):
+        try:
+            at = _login_and_get_access_token(origin, username, password)
+            # 4) mint the LLAT as the new user over a WS to the SAME origin.
+            return _mint_llat_as_user(mint_host, mint_port, at)
+        except (OSError, ValueError, ConnectionError, RuntimeError, urllib.error.URLError) as e:
+            last_err = e
+            _log(f"origin {origin} failed: {e}")
+            continue
+    if last_err:
+        raise last_err
+    return None
+
+
 def mint():
-    """Retry the mint across both WS targets. Supervisor proxy is PRIMARY (its token is minted for it);
-    the direct Core WS is a fallback if the proxy path is unavailable on this box."""
-    # (host, port, path). Supervisor proxy first, then Core direct.
-    targets = [
-        ("supervisor", 80, "/core/api/websocket"),
-        ("homeassistant", 8123, "/api/websocket"),
-    ]
     for attempt in range(1, MINT_ATTEMPTS + 1):
-        for host, port, path in targets:
-            jwt = _mint_over(host, port, path)
+        try:
+            jwt = _attempt()
             if jwt:
-                if attempt > 1 or (host, port) != targets[0][:2]:
-                    _log(f"minted via {host}:{port} on attempt {attempt}")
+                if attempt > 1:
+                    _log(f"succeeded on attempt {attempt}")
                 return jwt
+        except (OSError, ValueError, ConnectionError, RuntimeError, urllib.error.URLError) as e:
+            _log(f"attempt {attempt}/{MINT_ATTEMPTS} error: {e}")
         if attempt < MINT_ATTEMPTS:
             wait = BACKOFF_S * attempt
-            _log(f"attempt {attempt}/{MINT_ATTEMPTS} failed on all targets — retrying in {wait}s "
-                 f"(Core may still be starting)")
+            _log(f"retrying in {wait}s (Core may still be starting)")
             time.sleep(wait)
-    _log(f"mint FAILED after {MINT_ATTEMPTS} attempts on all targets")
+    _log(f"FAILED to obtain a user LLAT after {MINT_ATTEMPTS} attempts")
     return None
 
 
 if __name__ == "__main__":
     jwt = mint()
     if jwt:
-        sys.stdout.write(jwt)  # no trailing newline — addon-connect.sh captures it verbatim
+        sys.stdout.write(jwt)
         sys.exit(0)
     sys.exit(1)
