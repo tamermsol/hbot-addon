@@ -15,14 +15,18 @@ For each discovered device IP it then:
 
 No cloud broker: everything runs on the local network via the device HTTP API + HA's own MQTT.
 """
+import base64
+import hashlib
 import ipaddress
 import json
 import os
+import select
 import socket
+import struct
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 import requests
 import paho.mqtt.client as mqtt
 
@@ -119,6 +123,344 @@ def _start_health_listener():
         except Exception as e:
             log(f"health listener could not bind :{HEALTH_PORT}: {e} (watchdog disabled, add-on continues)")
     threading.Thread(target=serve, name="health", daemon=True).start()
+
+
+# ── Core API reverse-proxy (SUPERVISOR_TOKEN) ───────────────────────────────
+# The H-Bot app hits HA as $baseUrl/api/…  Directly against Core that needs a real Core bearer (an
+# LLAT), which the add-on's system user CANNOT mint (HA refuses — proven dead end). But the Supervisor
+# hands every add-on a SUPERVISOR_TOKEN that IS accepted by Core THROUGH the internal proxy
+# http://supervisor/core/api/ (developers.home-assistant.io/docs/add-ons/communication). So we stand up
+# a tiny reverse-proxy on 8098 that the app (via the CF tunnel) points its baseUrl at:
+#     app → 8098/api/…  →  http://supervisor/core/api/…  (+ Authorization: Bearer SUPERVISOR_TOKEN)
+# The app therefore needs NO Core token at all. Covers GET (states, camera_proxy[_stream]) and POST
+# (services/*); the camera stream is forwarded chunk-by-chunk so live video is not buffered.
+PROXY_PORT = int(os.environ.get("HBOT_PROXY_PORT", "8098"))
+SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", os.environ.get("HASSIO_TOKEN", ""))
+CORE_API = "http://supervisor/core/api"
+# Hop-by-hop headers that must NOT be forwarded (RFC 7230 §6.1) plus content-length/host which we
+# recompute, and authorization which we inject ourselves.
+_STRIP_REQ_HEADERS = {"host", "authorization", "content-length", "connection",
+                      "keep-alive", "proxy-authenticate", "proxy-authorization",
+                      "te", "trailers", "transfer-encoding", "upgrade", "accept-encoding",
+                      # X-Forwarded-* come from cloudflared; Core-via-supervisor doesn't need them and
+                      # forwarding an untrusted proxy chain risks a 400 — drop them at the proxy edge.
+                      "x-forwarded-for", "x-forwarded-proto", "x-forwarded-host", "cf-connecting-ip"}
+# RFC 6455 WebSocket GUID for the Sec-WebSocket-Accept handshake.
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+_STRIP_RESP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+                       "te", "trailers", "transfer-encoding", "upgrade", "content-encoding",
+                       "content-length"}
+
+
+# ── Minimal RFC 6455 WebSocket frame codec (text/binary/close/ping/pong), no external deps ─────────
+# HA's WS API speaks small text-JSON frames, so a tiny stdlib codec is enough and avoids adding an
+# asyncio websockets dependency to the Alpine image. Used only by the Core proxy's /api/websocket path.
+def _ws_read_frame(sock):
+    """Read one WebSocket frame from `sock`. Returns (opcode, payload_bytes) or (None, None) on close/EOF.
+    Handles masking (client→server frames are masked) and the 3 length encodings. Not fragmentation-
+    aware beyond a single continuation-less frame — HA never fragments its control JSON."""
+    try:
+        hdr = _recv_exactly(sock, 2)
+        if hdr is None:
+            return None, None
+        b0, b1 = hdr[0], hdr[1]
+        opcode = b0 & 0x0F
+        masked = (b1 & 0x80) != 0
+        ln = b1 & 0x7F
+        if ln == 126:
+            ext = _recv_exactly(sock, 2)
+            if ext is None:
+                return None, None
+            ln = struct.unpack(">H", ext)[0]
+        elif ln == 127:
+            ext = _recv_exactly(sock, 8)
+            if ext is None:
+                return None, None
+            ln = struct.unpack(">Q", ext)[0]
+        mask = _recv_exactly(sock, 4) if masked else None
+        payload = _recv_exactly(sock, ln) if ln else b""
+        if payload is None:
+            return None, None
+        if masked and mask:
+            payload = bytes(payload[i] ^ mask[i % 4] for i in range(len(payload)))
+        return opcode, payload
+    except Exception:
+        return None, None
+
+
+def _ws_build_frame(opcode, payload, mask=False):
+    """Build a WebSocket frame. mask=True (client role) is used for proxy→upstream; server→client is
+    unmasked per RFC 6455."""
+    b0 = 0x80 | (opcode & 0x0F)  # FIN + opcode
+    ln = len(payload)
+    if ln < 126:
+        header = struct.pack(">BB", b0, (0x80 if mask else 0) | ln)
+    elif ln < 65536:
+        header = struct.pack(">BBH", b0, (0x80 if mask else 0) | 126, ln)
+    else:
+        header = struct.pack(">BBQ", b0, (0x80 if mask else 0) | 127, ln)
+    if mask:
+        mk = os.urandom(4)
+        masked = bytes(payload[i] ^ mk[i % 4] for i in range(ln))
+        return header + mk + masked
+    return header + payload
+
+
+def _recv_exactly(sock, n):
+    """Read exactly n bytes from a blocking socket, or None on EOF."""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _ws_send_text(sock, obj, mask=False):
+    sock.sendall(_ws_build_frame(0x1, json.dumps(obj).encode("utf-8"), mask=mask))
+
+
+def _read_http_headers(sock):
+    """Read an HTTP response header block (up to the blank line) byte-by-byte, so no WS frame bytes are
+    consumed. Returns True on a 101 Switching Protocols, False otherwise."""
+    data = bytearray()
+    while b"\r\n\r\n" not in data:
+        b = sock.recv(1)
+        if not b:
+            return False
+        data.extend(b)
+        if len(data) > 8192:
+            return False
+    first = data.split(b"\r\n", 1)[0]
+    return b"101" in first
+
+
+def _start_core_proxy():
+    """Reverse-proxy /api/* → http://supervisor/core/api/* with the add-on's SUPERVISOR_TOKEN.
+
+    Threaded so a long-lived camera_proxy_stream request never blocks state/service calls. Runs in a
+    daemon thread; a bind failure logs and leaves the rest of the add-on (MQTT bridge) running."""
+    from http.server import BaseHTTPRequestHandler
+    try:
+        from socketserver import ThreadingMixIn
+        from http.server import HTTPServer
+
+        class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+            daemon_threads = True
+    except Exception:  # pragma: no cover — 3.7+ always has these
+        return
+
+    if not SUPERVISOR_TOKEN:
+        log("proxy: SUPERVISOR_TOKEN not present in env — Core proxy DISABLED "
+            "(is homeassistant_api:true set in config.yaml?)")
+        return
+
+    class _ProxyHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):  # silence the default stderr access log; we log our own line
+            pass
+
+        def _forward(self, method):
+            # Only proxy the HA API surface. Anything else is a 404 — the proxy is not a general
+            # open relay to Core.
+            if not self.path.startswith("/api"):
+                self.send_error(404, "not a proxied path")
+                return
+            target = f"{CORE_API}{self.path[len('/api'):]}"  # /api/states → http://supervisor/core/api/states
+            # Pass through the request body (POST services/*), if any.
+            body = None
+            clen = self.headers.get("Content-Length")
+            if clen:
+                try:
+                    body = self.rfile.read(int(clen))
+                except Exception:
+                    body = None
+            # Rebuild headers: drop hop-by-hop/auth/length, inject the SUPERVISOR bearer.
+            fwd_headers = {k: v for k, v in self.headers.items()
+                           if k.lower() not in _STRIP_REQ_HEADERS}
+            fwd_headers["Authorization"] = f"Bearer {SUPERVISOR_TOKEN}"
+            # stream=True so camera_proxy_stream (multipart/x-mixed-replace) is forwarded live, not
+            # read fully into memory. A long read timeout keeps a slow stream alive.
+            is_stream = "camera_proxy_stream" in self.path
+            try:
+                resp = requests.request(
+                    method, target, headers=fwd_headers, data=body,
+                    stream=True, timeout=(5, None if is_stream else 30))
+            except Exception as e:
+                log(f"proxy {method} {self.path} → upstream error: {e}")
+                self.send_error(502, "upstream error")
+                return
+            try:
+                self.send_response(resp.status_code)
+                for k, v in resp.headers.items():
+                    if k.lower() not in _STRIP_RESP_HEADERS:
+                        self.send_header(k, v)
+                # We stream the body ourselves with chunked transfer so we don't need Content-Length.
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if not chunk:
+                        continue
+                    self.wfile.write(b"%X\r\n" % len(chunk))
+                    self.wfile.write(chunk)
+                    self.wfile.write(b"\r\n")
+                    self.wfile.flush()
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+                log(f"proxy {method} {self.path} → {resp.status_code}")
+            except (BrokenPipeError, ConnectionResetError):
+                # Client (app) closed the camera stream — normal; don't spam the log.
+                pass
+            except Exception as e:
+                log(f"proxy {method} {self.path} write error: {e}")
+            finally:
+                resp.close()
+
+        # ── WebSocket bridge for /api/websocket (live state_changed) ──────────────────────────────
+        # The app opens ws://$baseUrl/api/websocket and expects HA's auth handshake. In proxy mode the
+        # app has NO Core token (it sends the sentinel `__hbot_proxy__`), so we CANNOT relay its auth to
+        # Core. Instead the proxy: (1) completes the client handshake, (2) opens its OWN upstream WS to
+        # http://supervisor/core/api/websocket and authenticates it with SUPERVISOR_TOKEN, (3) swallows
+        # the client's auth frame and answers `auth_ok` itself, then (4) relays every other frame both
+        # ways. The client thus gets a fully-authenticated live feed with no Core token.
+        def _handle_ws(self):
+            client = self.connection
+            # 1. Complete the client-side WebSocket handshake.
+            key = self.headers.get("Sec-WebSocket-Key")
+            if not key:
+                self.send_error(400, "missing Sec-WebSocket-Key")
+                return
+            accept = base64.b64encode(
+                hashlib.sha1((key + _WS_GUID).encode()).digest()).decode()
+            client.sendall(
+                b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                b"Sec-WebSocket-Accept: " + accept.encode() + b"\r\n\r\n")
+
+            # 2. Open the upstream WS to Core through the supervisor proxy and authenticate it.
+            up = None
+            try:
+                up_host = urlsplit(CORE_API).hostname or "supervisor"  # 'supervisor'
+                up = socket.create_connection((up_host, 80), timeout=15)
+                up_key = base64.b64encode(os.urandom(16)).decode()
+                up.sendall(
+                    ("GET /core/api/websocket HTTP/1.1\r\n"
+                     f"Host: {up_host}\r\n"
+                     "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                     f"Sec-WebSocket-Key: {up_key}\r\n"
+                     "Sec-WebSocket-Version: 13\r\n\r\n").encode())
+                # Read + discard the upstream 101 handshake response headers.
+                if not _read_http_headers(up):
+                    raise RuntimeError("upstream WS handshake failed")
+                # Upstream HA sends auth_required → reply with SUPERVISOR_TOKEN → expect auth_ok.
+                op, pl = _ws_read_frame(up)
+                if op != 0x1:
+                    raise RuntimeError("upstream: no auth_required text frame")
+                _ws_send_text(up, {"type": "auth", "access_token": SUPERVISOR_TOKEN}, mask=True)
+                op, pl = _ws_read_frame(up)
+                authed = op == 0x1 and json.loads(pl.decode()).get("type") == "auth_ok"
+                if not authed:
+                    raise RuntimeError(f"upstream auth rejected: {pl[:120] if pl else pl}")
+            except Exception as e:
+                log(f"proxy ws: upstream connect/auth failed: {e}")
+                try:
+                    client.sendall(_ws_build_frame(0x8, b""))  # close
+                except Exception:
+                    pass
+                if up:
+                    up.close()
+                return
+
+            # 3. Drive the client-side auth: send auth_required, swallow its auth frame, answer auth_ok.
+            try:
+                _ws_send_text(client, {"type": "auth_required", "ha_version": "proxy"})
+                op, pl = _ws_read_frame(client)
+                if op == 0x8 or op is None:
+                    raise ConnectionError("client closed during auth")
+                # We ignore whatever token the client sent (it's the sentinel) — upstream is already authed.
+                _ws_send_text(client, {"type": "auth_ok", "ha_version": "proxy"})
+            except Exception as e:
+                log(f"proxy ws: client auth failed: {e}")
+                up.close()
+                return
+
+            log("proxy ws: bridged /api/websocket (client↔Core, SUPERVISOR_TOKEN authed)")
+            # 4. Relay frames both ways until either side closes. Re-frame each side (unmask client→up,
+            #    mask up→client) so masking rules and length encodings are always correct.
+            self.close_connection = True  # stop BaseHTTPRequestHandler from reusing this hijacked socket
+            try:
+                self._ws_relay(client, up)
+            finally:
+                try: up.close()
+                except Exception: pass
+
+        def _ws_relay(self, client, up):
+            client.setblocking(True)
+            up.setblocking(True)
+            socks = [client, up]
+            while True:
+                r, _, x = select.select(socks, [], socks, 60)
+                if x:
+                    return
+                if not r:
+                    # 60s idle: send a ping upstream to keep the tunnel/socket warm.
+                    try:
+                        up.sendall(_ws_build_frame(0x9, b"", mask=True))
+                    except Exception:
+                        return
+                    continue
+                for s in r:
+                    src_is_client = s is client
+                    op, pl = _ws_read_frame(s)
+                    if op is None:
+                        return  # EOF on one side → tear down both
+                    if op == 0x8:  # close
+                        try:
+                            (up if src_is_client else client).sendall(
+                                _ws_build_frame(0x8, b"", mask=src_is_client))
+                        except Exception:
+                            pass
+                        return
+                    if op == 0x9:  # ping → pong back to the same side
+                        try:
+                            s.sendall(_ws_build_frame(0xA, pl or b"", mask=src_is_client))
+                        except Exception:
+                            return
+                        continue
+                    if op == 0xA:  # pong → ignore
+                        continue
+                    # text/binary/continuation: forward to the other side with correct masking.
+                    dst = up if src_is_client else client
+                    try:
+                        dst.sendall(_ws_build_frame(op, pl or b"", mask=src_is_client))
+                    except Exception:
+                        return
+
+        def do_GET(self):
+            # WebSocket upgrade on /api/websocket → live-state bridge; everything else → HTTP proxy.
+            if (self.path.startswith("/api/websocket")
+                    and "websocket" in (self.headers.get("Upgrade", "").lower())):
+                self._handle_ws()
+                return
+            self._forward("GET")
+
+        def do_POST(self):
+            self._forward("POST")
+
+        def do_DELETE(self):
+            self._forward("DELETE")
+
+    def serve():
+        try:
+            srv = ThreadingHTTPServer(("0.0.0.0", PROXY_PORT), _ProxyHandler)
+            log(f"Core API proxy up on :{PROXY_PORT} → {CORE_API} (SUPERVISOR_TOKEN injected)")
+            srv.serve_forever()
+        except Exception as e:
+            log(f"proxy could not bind :{PROXY_PORT}: {e} (Core proxy disabled, add-on continues)")
+
+    threading.Thread(target=serve, name="core-proxy", daemon=True).start()
 
 
 # ── account scoping (Option 2) ──────────────────────────────────────────────
@@ -771,6 +1113,9 @@ class Bridge:
         # Bring the watchdog health port up first thing, before any slow discovery/MQTT work, so the
         # Supervisor sees the add-on as healthy from the very start.
         _start_health_listener()
+        # Stand up the Core API reverse-proxy so the app reaches Core through the add-on's
+        # SUPERVISOR_TOKEN (no Core LLAT needed). This is what the CF tunnel exposes.
+        _start_core_proxy()
         log(f"config: manual={MANUAL_DEVICES} autodiscover={AUTODISCOVER} "
             f"subnets={SCAN_SUBNETS or 'auto'} account={ACCOUNT_EMAIL or 'none'} "
             f"mqtt={MQTT_HOST}:{MQTT_PORT} prefix={PREFIX} poll={POLL}s")
