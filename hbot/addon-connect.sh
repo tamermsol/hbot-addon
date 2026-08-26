@@ -257,15 +257,73 @@ ensure_trusted_proxies() {
 ensure_trusted_proxies
 
 echo "[hbot-connect] starting cloudflared → ${URL}"
-# Supervised retry loop: if cloudflared ever exits (network blip, CF edge hiccup, CGNAT re-NAT), the
-# add-on used to stay "started" (the python bridge is the foreground process) while the tunnel stayed
-# DEAD — the app then saw Cloudflare 530/1033 with no self-healing. Wrap it so a drop reconnects
-# automatically with capped backoff. --retries and --grace-period make cloudflared itself hold on
-# harder before giving up a connection; the outer loop covers a full process exit.
+# ── Cloudflare 530/1033 self-heal ──────────────────────────────────────────────
+# Two failure modes must both be covered:
+#   (a) cloudflared PROCESS EXITS (network blip, CF edge hiccup, CGNAT re-NAT) —
+#       the outer supervised retry loop below reconnects with capped backoff.
+#   (b) cloudflared stays ALIVE but its edge/named-tunnel connections go DEAD
+#       (Cloudflare 1033 = "no connected origin"). The process never exits, so the
+#       retry loop in (a) NEVER fires and the app sees 530/1033 forever. This is the
+#       real production bug. To catch it we run cloudflared with a local metrics
+#       server and an ACTIVE health-watchdog that probes /ready; when the tunnel is
+#       dead-but-process-alive for N consecutive checks it KILLS the pid, which drops
+#       it into the (a) retry loop for a fresh set of edge connections.
+# The v1.4.6 watchdog that did this was lost in the 1.4.7→1.4.19 rewrite; re-added here.
+
+METRICS_PORT=36429   # cloudflared /ready + /metrics served locally on this port
+WD_INTERVAL=25       # seconds between health probes
+WD_FAIL_LIMIT=3      # consecutive dead probes before we kill (rides out transient blips)
+
+# health_watchdog <cloudflared_pid> — probes the local metrics /ready endpoint and
+# kills the tunnel when it is dead-but-alive so the supervisor respawns it.
+health_watchdog() {
+  local pid="$1" fails=0 body code conns
+  # Give cloudflared a moment to bind the metrics server + establish first connections.
+  sleep 20
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep "$WD_INTERVAL"
+    kill -0 "$pid" 2>/dev/null || break   # process exited → (a) loop handles it.
+    # Primary signal: cloudflared's own /ready. 200 = has live edge connections.
+    code=$(curl -s -o /dev/null -w '%{http_code}' -m 8 "http://127.0.0.1:${METRICS_PORT}/ready" 2>/dev/null)
+    if [ "$code" = "200" ]; then
+      fails=0
+      continue
+    fi
+    # /ready non-200 (or unreachable). Fall back to scraping the connection-count
+    # gauge from /metrics — a build without /ready still exposes cloudflared_tunnel_ha_connections.
+    if [ -z "$code" ] || [ "$code" = "000" ]; then
+      body=$(curl -s -m 8 "http://127.0.0.1:${METRICS_PORT}/metrics" 2>/dev/null)
+      conns=$(printf '%s\n' "$body" | awk '/^cloudflared_tunnel_ha_connections /{s+=$2} END{print s+0}')
+      if [ "${conns:-0}" -gt 0 ]; then
+        fails=0
+        continue
+      fi
+    fi
+    fails=$(( fails + 1 ))
+    echo "[hbot-connect] watchdog: tunnel unhealthy (ready_code=${code:-none} fails=${fails}/${WD_FAIL_LIMIT})"
+    if [ "$fails" -ge "$WD_FAIL_LIMIT" ]; then
+      echo "[hbot-connect] watchdog: dead-but-alive tunnel — killing cloudflared pid=${pid} to force fresh edge connections."
+      kill "$pid" 2>/dev/null
+      sleep 3
+      kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+      return   # cloudflared will exit → outer loop respawns it (and a new watchdog).
+    fi
+  done
+}
+
+# Supervised retry loop covering failure mode (a); the watchdog covers (b).
 backoff=2
 while true; do
-  cloudflared tunnel --no-autoupdate --retries 10 --grace-period 30s run --token "$TUNNEL_TOKEN"
+  # --metrics binds the local liveness server the watchdog probes.
+  cloudflared tunnel --no-autoupdate --retries 10 --grace-period 30s \
+    --metrics "127.0.0.1:${METRICS_PORT}" run --token "$TUNNEL_TOKEN" &
+  cf_pid=$!
+  echo "[hbot-connect] cloudflared started pid=${cf_pid} (metrics 127.0.0.1:${METRICS_PORT})"
+  health_watchdog "$cf_pid" &
+  wd_pid=$!
+  wait "$cf_pid"          # blocks until cloudflared exits (crash, or watchdog kill)
   rc=$?
+  kill "$wd_pid" 2>/dev/null   # retire this cloudflared's watchdog; a fresh one starts next iteration.
   echo "[hbot-connect] cloudflared exited rc=$rc — reconnecting in ${backoff}s (tunnel auto-heal)."
   sleep "$backoff"
   # exponential backoff capped at 60s so a persistent outage doesn't hammer the CF edge.
