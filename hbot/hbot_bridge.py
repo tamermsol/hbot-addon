@@ -152,6 +152,90 @@ _STRIP_RESP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-
                        "content-length"}
 
 
+# HA Core's camera_proxy (snapshot) WORKS but is dead-slow cold (5–14s) and intermittently 500s/times
+# out under load; camera_proxy_stream (native MJPEG) returns 0 BYTES on idle cameras. A bare
+# single-attempt forward therefore paints "Camera offline" in the app on the first flaky frame. To make
+# a reachable-but-slow camera ALWAYS deliver a frame, the proxy:
+#   • retries snapshot fetches (3x, backoff) with a generous read timeout, and caches the last-good JPEG
+#     per entity so a transient 500 serves the stale frame (200 + X-HBot-Cache: stale) instead of failing;
+#   • synthesizes an MJPEG multipart stream from those cached/polled snapshots when the native stream
+#     yields no bytes, so "LIVE" shows moving still-frames even on a dead native stream.
+_SNAPSHOT_READ_TIMEOUT = 20      # cold frames can take 14s — don't cut them off
+_SNAPSHOT_RETRIES = 3            # attempts on >=500 / raise
+_SNAPSHOT_BACKOFF = (0.5, 1.0)   # sleeps between attempts (last value reused if more attempts)
+_CACHE_MAX_BYTES = 1_000_000     # cap a single cached JPEG at ~1MB
+_CACHE_MAX_ENTRIES = 32          # cap total distinct cameras cached
+_SYNTH_FIRST_BYTES_TIMEOUT = 4.0 # native stream must produce bytes within this or we synthesize
+_SYNTH_FPS_INTERVAL = 1.0        # synthesized-stream snapshot cadence (cameras can't produce faster)
+_SYNTH_BOUNDARY = "hbotframe"    # multipart boundary for the synthesized MJPEG stream
+
+_cam_cache = {}                  # entity_id -> jpeg bytes (last-good)
+_cam_cache_lock = threading.Lock()
+
+
+def _cam_entity_from_path(path):
+    """Extract the camera entity_id from a camera_proxy[_stream] path.
+
+    Paths look like /api/camera_proxy/camera.dev_room?token=… or
+    /api/camera_proxy_stream/camera.dev_room?token=… — the entity is the segment after the
+    camera_proxy(_stream)/ marker, up to the query string."""
+    for marker in ("camera_proxy_stream/", "camera_proxy/"):
+        i = path.find(marker)
+        if i != -1:
+            rest = path[i + len(marker):]
+            return rest.split("?", 1)[0].split("/", 1)[0] or None
+    return None
+
+
+def _cache_put(entity, data):
+    if not entity or not data or len(data) > _CACHE_MAX_BYTES:
+        return
+    with _cam_cache_lock:
+        # Simple bound: if full and this is a new key, drop an arbitrary existing entry.
+        if entity not in _cam_cache and len(_cam_cache) >= _CACHE_MAX_ENTRIES:
+            _cam_cache.pop(next(iter(_cam_cache)), None)
+        _cam_cache[entity] = data
+
+
+def _cache_get(entity):
+    if not entity:
+        return None
+    with _cam_cache_lock:
+        return _cam_cache.get(entity)
+
+
+def _fetch_snapshot(path, fwd_headers):
+    """Fetch a single camera snapshot from Core with retry, caching the last-good JPEG per entity.
+
+    Returns (status_code, content_bytes, from_cache: bool). On total failure with a cached frame,
+    returns the cached bytes with status 200 (from_cache=True). On total failure with no cache,
+    returns the last upstream (status, body) — or (502, b"") if the request never completed."""
+    entity = _cam_entity_from_path(path)
+    target = f"{CORE_API}{path[len('/api'):]}"
+    last_status, last_body = 502, b""
+    for attempt in range(_SNAPSHOT_RETRIES):
+        try:
+            r = requests.get(target, headers=fwd_headers, timeout=(5, _SNAPSHOT_READ_TIMEOUT))
+            last_status = r.status_code
+            if r.status_code < 500:
+                last_body = r.content
+                if 200 <= r.status_code < 300 and last_body:
+                    _cache_put(entity, last_body)
+                return r.status_code, last_body, False
+            last_body = r.content[:200]  # keep only a snippet of an error body
+        except Exception as e:
+            log(f"proxy snapshot {path} attempt {attempt+1} error: {e}")
+        if attempt < _SNAPSHOT_RETRIES - 1:
+            time.sleep(_SNAPSHOT_BACKOFF[min(attempt, len(_SNAPSHOT_BACKOFF) - 1)])
+    # All attempts failed (>=500 or raised). Serve the last-good cached frame if we have one.
+    cached = _cache_get(entity)
+    if cached:
+        log(f"proxy snapshot {path} → all {_SNAPSHOT_RETRIES} attempts failed; serving cached frame "
+            f"({len(cached)} bytes, X-HBot-Cache: stale)")
+        return 200, cached, True
+    return last_status, last_body, False
+
+
 # ── Minimal RFC 6455 WebSocket frame codec (text/binary/close/ping/pong), no external deps ─────────
 # HA's WS API speaks small text-JSON frames, so a tiny stdlib codec is enough and avoids adding an
 # asyncio websockets dependency to the Alpine image. Used only by the Core proxy's /api/websocket path.
@@ -281,6 +365,18 @@ def _start_core_proxy():
             fwd_headers = {k: v for k, v in self.headers.items()
                            if k.lower() not in _STRIP_REQ_HEADERS}
             fwd_headers["Authorization"] = f"Bearer {SUPERVISOR_TOKEN}"
+
+            # ── Camera reliability paths (see module-level _fetch_snapshot / _synth_stream) ──
+            # A snapshot (camera_proxy/, NOT camera_proxy_stream) always gets retry+cache so a slow/
+            # flaky camera returns a real frame (fresh or last-good) instead of "Camera offline".
+            if method == "GET" and "camera_proxy_stream" not in self.path and "camera_proxy/" in self.path:
+                self._forward_snapshot(fwd_headers)
+                return
+            # A native MJPEG stream that produces no first bytes → synthesize one from snapshots so LIVE
+            # shows moving still-frames even when the camera's native stream is dead.
+            if method == "GET" and "camera_proxy_stream" in self.path:
+                self._forward_camera_stream(fwd_headers)
+                return
             # stream=True so camera_proxy_stream (multipart/x-mixed-replace) is forwarded live, not
             # read fully into memory. A long read timeout keeps a slow stream alive.
             is_stream = "camera_proxy_stream" in self.path
@@ -317,6 +413,164 @@ def _start_core_proxy():
                 log(f"proxy {method} {self.path} write error: {e}")
             finally:
                 resp.close()
+
+        # ── Camera snapshot: retry + last-good cache (never false-offline a reachable camera) ─────
+        def _forward_snapshot(self, fwd_headers):
+            status, body, from_cache = _fetch_snapshot(self.path, fwd_headers)
+            try:
+                self.send_response(status)
+                ctype = "image/jpeg" if body[:2] == b"\xff\xd8" else "application/octet-stream"
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                if from_cache:
+                    self.send_header("X-HBot-Cache", "stale")
+                self.end_headers()
+                if body:
+                    self.wfile.write(body)
+                    self.wfile.flush()
+                log(f"proxy GET {self.path} → {status} "
+                    f"({len(body)} bytes{', cached' if from_cache else ''})")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as e:
+                log(f"proxy snapshot {self.path} write error: {e}")
+
+        # ── Camera stream: native MJPEG, or synthesize one from snapshots if native yields 0 bytes ─
+        def _forward_camera_stream(self, fwd_headers):
+            target = f"{CORE_API}{self.path[len('/api'):]}"
+            resp = None
+            try:
+                # Read timeout = probe window: a native stream that sends no bytes within this raises
+                # ReadTimeout (caught below) so we synthesize. A LIVE native stream sends its multipart
+                # preamble/first frame well inside this window, then we forward with no further limit.
+                resp = requests.get(target, headers=fwd_headers, stream=True,
+                                    timeout=(5, _SYNTH_FIRST_BYTES_TIMEOUT + 1))
+            except Exception as e:
+                log(f"proxy stream {self.path} → native upstream error: {e}; synthesizing.")
+                self._synth_stream(fwd_headers)
+                return
+            # Probe for the first native bytes within a short window. If none arrive (idle-camera
+            # 0-byte case), abandon the native stream and synthesize from snapshots instead.
+            first_chunk = None
+            try:
+                if resp.status_code < 400:
+                    # A 5s socket read timeout on the native stream bounds the wait: a 0-byte idle
+                    # stream raises ReadTimeout instead of blocking forever, so we fall to synth.
+                    start = time.monotonic()
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        if chunk:
+                            first_chunk = chunk
+                            break
+                        if time.monotonic() - start > _SYNTH_FIRST_BYTES_TIMEOUT:
+                            break
+            except Exception as e:
+                log(f"proxy stream {self.path} native probe error: {e}")
+            if not first_chunk:
+                log(f"proxy stream {self.path} → native produced 0 bytes in "
+                    f"{_SYNTH_FIRST_BYTES_TIMEOUT}s (status {resp.status_code if resp else '?'}); synthesizing MJPEG.")
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                self._synth_stream(fwd_headers)
+                return
+            # Native stream is alive — forward it through, chunked, WITHOUT buffering: chain the probe's
+            # first chunk with the continued live iterator (never materialize the stream into a list).
+            from itertools import chain
+            try:
+                self.send_response(resp.status_code)
+                for k, v in resp.headers.items():
+                    if k.lower() not in _STRIP_RESP_HEADERS:
+                        self.send_header(k, v)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                for chunk in chain([first_chunk], resp.iter_content(chunk_size=8192)):
+                    if not chunk:
+                        continue
+                    self.wfile.write(b"%X\r\n" % len(chunk))
+                    self.wfile.write(chunk)
+                    self.wfile.write(b"\r\n")
+                    self.wfile.flush()
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+                log(f"proxy stream {self.path} → native forwarded ({resp.status_code})")
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # client closed the stream — normal
+            except requests.exceptions.RequestException as e:
+                # Mid-stream upstream stall/drop: end our chunked stream cleanly so the client can retry.
+                log(f"proxy stream {self.path} native stalled mid-stream: {e}")
+                try:
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                except Exception:
+                    pass
+            except Exception as e:
+                log(f"proxy stream {self.path} native write error: {e}")
+            finally:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+
+        def _synth_stream(self, fwd_headers):
+            """Generate a multipart/x-mixed-replace MJPEG stream by polling camera_proxy snapshots
+            (reusing the retry+cache path) at ~1 fps. Keeps LIVE showing moving still-frames even when
+            the camera's native MJPEG stream is dead. Runs until the client disconnects."""
+            # Derive the snapshot path from the stream path.
+            snap_path = self.path.replace("camera_proxy_stream", "camera_proxy", 1)
+            try:
+                self.send_response(200)
+                self.send_header(
+                    "Content-Type", f"multipart/x-mixed-replace; boundary={_SYNTH_BOUNDARY}")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-HBot-Synth", "mjpeg")
+                # No Content-Length / chunked: multipart/x-mixed-replace is a length-less byte stream.
+                self.send_header("Connection", "close")
+                self.close_connection = True
+                self.end_headers()
+            except Exception as e:
+                log(f"proxy synth {snap_path} header error: {e}")
+                return
+            entity = _cam_entity_from_path(snap_path)
+            frames = 0
+
+            def _emit(jpeg):
+                """Write one MJPEG part. Returns False if the client has gone (caller stops)."""
+                nonlocal frames
+                try:
+                    self.wfile.write(
+                        b"--" + _SYNTH_BOUNDARY.encode() + b"\r\n"
+                        b"Content-Type: image/jpeg\r\n"
+                        b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
+                        + jpeg + b"\r\n")
+                    self.wfile.flush()
+                    frames += 1
+                    return True
+                except (BrokenPipeError, ConnectionResetError):
+                    return False
+                except Exception as e:
+                    log(f"proxy synth {snap_path} write error after {frames} frame(s): {e}")
+                    return False
+
+            # 1) Emit the last-good cached frame IMMEDIATELY so LIVE shows an image within ms — never
+            #    make the client wait out a full retry window (up to ~20s on a dead box) for frame 1.
+            last = _cache_get(entity)
+            if last and not _emit(last):
+                log(f"proxy synth {snap_path} → client closed after {frames} frame(s)")
+                return
+
+            # 2) Poll snapshots ~1 fps; each successful/cached fetch refreshes `last`. Re-emit the
+            #    freshest frame every interval so the stream keeps moving even when fresh polls fail.
+            while True:
+                status, body, from_cache = _fetch_snapshot(snap_path, fwd_headers)
+                if body and body[:2] == b"\xff\xd8":
+                    last = body
+                if last:
+                    if not _emit(last):
+                        log(f"proxy synth {snap_path} → client closed after {frames} frame(s)")
+                        return
+                time.sleep(_SYNTH_FPS_INTERVAL)
 
         # ── WebSocket bridge for /api/websocket (live state_changed) ──────────────────────────────
         # The app opens ws://$baseUrl/api/websocket and expects HA's auth handshake. In proxy mode the
