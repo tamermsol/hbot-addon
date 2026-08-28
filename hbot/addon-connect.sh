@@ -264,45 +264,82 @@ echo "[hbot-connect] starting cloudflared → ${URL}"
 #   (b) cloudflared stays ALIVE but its edge/named-tunnel connections go DEAD
 #       (Cloudflare 1033 = "no connected origin"). The process never exits, so the
 #       retry loop in (a) NEVER fires and the app sees 530/1033 forever. This is the
-#       real production bug. To catch it we run cloudflared with a local metrics
-#       server and an ACTIVE health-watchdog that probes /ready; when the tunnel is
-#       dead-but-process-alive for N consecutive checks it KILLS the pid, which drops
-#       it into the (a) retry loop for a fresh set of edge connections.
-# The v1.4.6 watchdog that did this was lost in the 1.4.7→1.4.19 rewrite; re-added here.
+#       real production bug.
+#
+# v1.4.22 — END-TO-END PUBLIC PROBE. The v1.4.6/1.4.20 watchdog probed ONLY cloudflared's
+# LOCAL /ready + /metrics. That reflects the CONNECTOR's own view ("do I think I have edge
+# connections") — but the recurring outage (4th today) is the origin DE-REGISTERING at the
+# Cloudflare edge while the connector process stays alive and can even still report /ready=200.
+# In that state the LOCAL signals look healthy but the PUBLIC URL returns 530/1033 and the
+# customer sees "HA disconnected". The only signal that catches this is fetching the PUBLIC
+# tunnel URL from the internet and checking the real end-to-end response.
+#
+# We now run TWO independent checks each cycle:
+#   • PUBLIC (authoritative): GET ${URL}/api/ over the internet. HA rejects unauthenticated
+#     /api/ with 401 → 401 means the tunnel is alive AND reaching Core end-to-end (this is the
+#     exact success signal the ops runbook uses). 200 also counts as reachable. A CF-edge
+#     failure returns 530/1033/502/000/timeout = origin not connected → count a failure.
+#   • LOCAL (secondary): the old /ready + /metrics scrape, kept as a fast corroborating signal.
+# Two consecutive PUBLIC failures (default) force-kill cloudflared → the (a) retry loop respawns
+# it and the origin re-registers within seconds. Every detection + kill is logged with a UTC
+# timestamp so we can prove the watchdog fired.
 
 METRICS_PORT=36429   # cloudflared /ready + /metrics served locally on this port
-WD_INTERVAL=25       # seconds between health probes
-WD_FAIL_LIMIT=3      # consecutive dead probes before we kill (rides out transient blips)
+WD_INTERVAL=30       # seconds between health probes
+WD_FAIL_LIMIT=2      # consecutive PUBLIC-dead probes before we kill (rides out one transient blip)
+WD_PUBLIC_URL="$URL" # the public tunnel URL provisioned above (also in $STATE_FILE)
 
-# health_watchdog <cloudflared_pid> — probes the local metrics /ready endpoint and
-# kills the tunnel when it is dead-but-alive so the supervisor respawns it.
+ts() { date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo '?'; }
+
+# public_probe — GET the PUBLIC tunnel URL end-to-end (through the CF edge). Echoes the HTTP code.
+# 401 or 200 on /api/ ⇒ healthy origin. 530/1033/502/000/timeout ⇒ origin de-registered/dead.
+public_probe() {
+  [ -n "$WD_PUBLIC_URL" ] || { echo 000; return; }
+  curl -s -o /dev/null -w '%{http_code}' -m 10 "${WD_PUBLIC_URL}/api/" 2>/dev/null || echo 000
+}
+
+# local_healthy — cloudflared's own view (fast corroboration). Returns 0 if it looks connected.
+local_healthy() {
+  local code body conns
+  code=$(curl -s -o /dev/null -w '%{http_code}' -m 8 "http://127.0.0.1:${METRICS_PORT}/ready" 2>/dev/null)
+  [ "$code" = "200" ] && return 0
+  if [ -z "$code" ] || [ "$code" = "000" ]; then
+    body=$(curl -s -m 8 "http://127.0.0.1:${METRICS_PORT}/metrics" 2>/dev/null)
+    conns=$(printf '%s\n' "$body" | awk '/^cloudflared_tunnel_ha_connections /{s+=$2} END{print s+0}')
+    [ "${conns:-0}" -gt 0 ] && return 0
+  fi
+  return 1
+}
+
+# health_watchdog <cloudflared_pid> — probes the PUBLIC tunnel URL end-to-end (authoritative) and
+# kills the tunnel when the public edge is dead-but-process-alive so the supervisor respawns it.
 health_watchdog() {
-  local pid="$1" fails=0 body code conns
-  # Give cloudflared a moment to bind the metrics server + establish first connections.
-  sleep 20
+  local pid="$1" fails=0 pcode
+  # Give cloudflared a moment to bind the metrics server + establish first edge connections and
+  # for DNS/ingress to propagate before the first PUBLIC probe.
+  sleep 25
   while kill -0 "$pid" 2>/dev/null; do
     sleep "$WD_INTERVAL"
     kill -0 "$pid" 2>/dev/null || break   # process exited → (a) loop handles it.
-    # Primary signal: cloudflared's own /ready. 200 = has live edge connections.
-    code=$(curl -s -o /dev/null -w '%{http_code}' -m 8 "http://127.0.0.1:${METRICS_PORT}/ready" 2>/dev/null)
-    if [ "$code" = "200" ]; then
-      fails=0
-      continue
-    fi
-    # /ready non-200 (or unreachable). Fall back to scraping the connection-count
-    # gauge from /metrics — a build without /ready still exposes cloudflared_tunnel_ha_connections.
-    if [ -z "$code" ] || [ "$code" = "000" ]; then
-      body=$(curl -s -m 8 "http://127.0.0.1:${METRICS_PORT}/metrics" 2>/dev/null)
-      conns=$(printf '%s\n' "$body" | awk '/^cloudflared_tunnel_ha_connections /{s+=$2} END{print s+0}')
-      if [ "${conns:-0}" -gt 0 ]; then
+    # AUTHORITATIVE signal: the public URL, end-to-end through the CF edge.
+    pcode="$(public_probe)"
+    case "$pcode" in
+      200|401|403)
+        # Reachable end-to-end (401/403 = HA answered = origin connected). Healthy.
         fails=0
         continue
-      fi
+        ;;
+    esac
+    # Public probe failed. If cloudflared's LOCAL view is ALSO unhealthy, that's a strong signal;
+    # either way a failing PUBLIC probe is what the customer experiences, so we count it.
+    if local_healthy; then
+      echo "[hbot-connect] watchdog $(ts): PUBLIC probe failed (code=${pcode}) but connector /ready looks up — likely edge de-register; fails=$(( fails + 1 ))/${WD_FAIL_LIMIT}"
+    else
+      echo "[hbot-connect] watchdog $(ts): PUBLIC probe failed (code=${pcode}) and connector /ready down too; fails=$(( fails + 1 ))/${WD_FAIL_LIMIT}"
     fi
     fails=$(( fails + 1 ))
-    echo "[hbot-connect] watchdog: tunnel unhealthy (ready_code=${code:-none} fails=${fails}/${WD_FAIL_LIMIT})"
     if [ "$fails" -ge "$WD_FAIL_LIMIT" ]; then
-      echo "[hbot-connect] watchdog: dead-but-alive tunnel — killing cloudflared pid=${pid} to force fresh edge connections."
+      echo "[hbot-connect] watchdog $(ts): tunnel dead end-to-end (last public code=${pcode}) — killing cloudflared pid=${pid} to force origin re-registration."
       kill "$pid" 2>/dev/null
       sleep 3
       kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
