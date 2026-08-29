@@ -1,368 +1,156 @@
 #!/usr/bin/env bash
 # addon-connect.sh — drop into the HBot HA add-on (hbot-addon/hbot/run.sh) so, on FIRST BOOT, the
-# add-on connects this HA install to the H-Bot app with ZERO user typing (BURDEN 1).
+# add-on obtains a stable public URL for this HA install with ZERO user typing (BURDEN 1).
 #
-# The app's registerHomeAssistantFromDb needs BOTH ha_connections.base_url AND access_token. This
-# script supplies both:
-#   1. Read the paired home_id + provisioning_token (persisted at /data/{home_id,provisioning_token}
-#      by the pairing/claim flow — see addon-claim.sh).
-#   2. MINT a Home Assistant access token from inside HAOS (SUPERVISOR_TOKEN — Core accepts it as a
-#      bearer, and it reaches Core both on the LAN and through the tunnel which routes to homeassistant:8123).
-#   3. LAN FAST PATH: immediately POST /ha-connection {base_url: LAN URL, access_token} so the app can
-#      connect on-network the instant pairing finishes — WITHOUT waiting for Cloudflare.
-#   4. POST /provision {home_id, access_token} → hbot-connect mints the stable tunnel and (server-side,
-#      service key) upgrades ha_connections.base_url to the tunnel URL + stores the token. This is why
-#      we send the token here and NOT via a direct Supabase PATCH: the table's RLS (auth.uid()=user_id)
-#      makes the add-on's own anon write update 0 rows — only the server (service key) can persist it.
-#   5. Start cloudflared with the tunnel token (HA now reachable at the stable URL, even behind CGNAT).
+# ⚑ SOURCE OF TRUTH: THIS file (hbotv2/ha-integration/hbot-connect/addon-connect.sh) is the ONE
+#   canonical copy. The operator's HA box installs the add-on from the GitHub repo tamermsol/hbot-addon;
+#   whoever cuts a new add-on version MUST copy this file into that repo's hbot/addon-connect.sh so the
+#   fix actually reaches the box. See SYNC-ADDON.md in this directory. Do NOT hand-edit a separate copy
+#   (the split between this and hbot-addon/hbot/addon-connect.sh is exactly why the tunnel watchdog kept
+#   regressing — fixes landed in one copy but the box shipped the other).
 #
-# Requires: HBOT_CONNECT_URL. SUPERVISOR_TOKEN is provided automatically to add-ons (homeassistant_api).
+# Flow:
+#   1. Read the paired home_id (written when the user paired this HA in the app — same anon flow the
+#      wall panel uses, memory panel-account-rebind). Persisted at /data/home_id.
+#   2. POST /provision {home_id} to hbot-connect → { url, token }.
+#   3. Start cloudflared with the token (HA now reachable at the stable URL, even behind CGNAT).
+#   4. Write the URL back to Supabase ha_connections.base_url for this home, so the app reads it and
+#      never asks the user for a URL. Token is stored in HA add-on options (never sent to the app).
+#
+# Requires (add-on options): HBOT_CONNECT_URL, SUPABASE_URL, SUPABASE_ANON_KEY.
 set -euo pipefail
 
 HOME_ID_FILE="/data/home_id"
 TOKEN_FILE="/data/provisioning_token"   # per-install token minted in the app at HA-pair time
-HAID_FILE="/data/ha_id"
-CODE_FILE="/data/claim_code"
 STATE_FILE="/data/tunnel_url"
 HBOT_CONNECT_URL="${HBOT_CONNECT_URL:?set HBOT_CONNECT_URL}"
 
-# ── SELF-HEAL (v1.4.17): don't depend on the claim POLL subshell having written the files ──────────────
-# ROOT CAUSE of "approved but nothing happens": addon-claim.sh persisted /data/{home_id,provisioning_token}
-# ONLY inside its 15-min in-process poll. If that subshell died (add-on UPDATE/restart mid-pairing) or the
-# approval landed after the loop, the files were never written → this script's old "not paired → skip" gate
-# skipped connect PERMANENTLY, even though the server already had the token. We now fetch the token
-# OURSELVES from the persisted STABLE (code, ha_id): a single restart completes pairing.
-if [[ ! -s "$HOME_ID_FILE" || ! -s "$TOKEN_FILE" ]]; then
-  # Recover the stable ha_id + code the same deterministic way addon-claim.sh derives them (machine-id),
-  # so this works even if /data was partially wiped. A persisted file takes precedence.
-  MID="$(cat /etc/machine-id 2>/dev/null || cat /data/.mid 2>/dev/null || true)"
-  HA_ID="$(cat "$HAID_FILE" 2>/dev/null || true)"
-  [[ -z "$HA_ID" && -n "$MID" ]] && HA_ID="ha-$(printf '%s' "$MID" | sha256sum | cut -c1-24)"
-  CODE="$(cat "$CODE_FILE" 2>/dev/null || true)"
-  [[ -z "$CODE" && -n "$MID" ]] && CODE="HBOT$(printf 'hbot-claim:%s' "$MID" | sha256sum | tr 'a-f' 'A-F' | head -c 8)"
-  if [[ -z "$CODE" || -z "$HA_ID" ]]; then
-    echo "[hbot-connect] not paired yet (no token files and no derivable claim code/ha_id) — skipping."
-    exit 0
-  fi
-  echo "[hbot-connect] token files missing — self-fetching via /claim/status (code ${CODE})…"
-  RESP="$(curl -fsS -m 15 -X POST "${HBOT_CONNECT_URL}/claim/status" \
-    -H 'Content-Type: application/json' \
-    --data "{\"code\":\"${CODE}\",\"ha_id\":\"${HA_ID}\"}" 2>/dev/null || echo '')"
-  STATUS="$(echo "$RESP" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')"
-  if [[ "$STATUS" == "approved" ]]; then
-    T="$(echo "$RESP" | sed -n 's/.*"provisioning_token":"\([^"]*\)".*/\1/p')"
-    H="$(echo "$RESP" | sed -n 's/.*"home_id":"\([^"]*\)".*/\1/p')"
-    if [[ -n "$T" && -n "$H" ]]; then
-      mkdir -p /data
-      printf '%s' "$T" > "$TOKEN_FILE"
-      printf '%s' "$H" > "$HOME_ID_FILE"
-      echo "[hbot-connect] self-heal: fetched approved token for home ${H} — proceeding to mint + connect."
-    else
-      echo "[hbot-connect] /claim/status approved but missing token/home in response — awaiting; exiting 0 (retry next boot)."
-      exit 0
-    fi
-  else
-    echo "[hbot-connect] awaiting approval (status=${STATUS:-none}) — LAN-only for now; a later boot retries."
-    exit 0
-  fi
+# Idempotent: if we already provisioned + still have cloudflared token, just (re)start the tunnel.
+if [[ ! -f "$HOME_ID_FILE" || ! -f "$TOKEN_FILE" ]]; then
+  echo "[hbot-connect] not paired yet (need home_id + provisioning_token) — skipping zero-config tunnel (prosumer manual-URL path)."
+  exit 0
 fi
 HOME_ID="$(cat "$HOME_ID_FILE")"
 PROV_TOKEN="$(cat "$TOKEN_FILE")"
 
-# ── LAN base_url: reach Core directly on-network. Computed EARLY because we verify the minted token
-# against this exact DIRECT endpoint (the one the app calls), not the supervisor proxy. Prefer the
-# add-on's own primary IP (host_network), fall back to the mDNS name every HAOS install answers to. ──
-LAN_IP="$(hostname -i 2>/dev/null | awk '{print $1}')"
-if [[ -n "$LAN_IP" && "$LAN_IP" != "127.0.0.1" ]]; then
-  LAN_URL="http://${LAN_IP}:8123"
-else
-  LAN_URL="http://homeassistant.local:8123"
-fi
-
-# ── Mint the HA access token the app will use — ROBUST, NEVER SILENT (v1.4.16), NON-SYSTEM USER (v1.4.18).
-#
-# CRITICAL (HA docs): the SUPERVISOR_TOKEN is ONLY valid via the internal proxy http://supervisor/core/api/
-# — NOT accepted by Core's DIRECT external API at homeassistant.local:8123/api/, which is what the phone app
-# calls. Writing it as access_token yields 401.
-#
-# v1.4.18 PIVOT (the LLAT-as-supervisor mint was a source-proven DEAD END: the supervisor's Core user is
-# system_generated, and HA refuses auth/long_lived_access_token for a system user → {"code":"unknown_error"}).
-# mint_llat.py now, over the supervisor proxy WS (admin identity), CREATES a dedicated NON-system HA user +
-# login credential, logs in AS that user, and mints an LLAT AS THAT USER — which HA permits. That JWT is a
-# real Core token accepted by the direct /api/. mint_llat.py still prints ONLY the JWT to stdout on success.
-#
-# We VERIFY the minted token against the DIRECT api the same way the app will (LAN_URL/api/, NOT the
-# supervisor proxy). This is the AUTONOMY-CRITICAL step: a real operator box left ha_connections.access_token
-# NULL because the mint failed SILENTLY and we POSTed an empty token — so the app had base_url but no token
-# and "nothing happened". We now:
-#   • LOOP the mint+verify up to MINT_TRIES over ~2 min (Core may not be fully up on first boot);
-#   • on success, write base_url + token TOGETHER (order: mint FIRST, then /provision);
-#   • on total failure, DO NOT post an empty token — instead record a mint_error DIAGNOSTIC server-side so
-#     the box never looks "paired" while silently tokenless, and log the reason prominently.
-HA_TOKEN=""
-MINT_ERROR=""
-MINT_TRIES="${MINT_TRIES:-10}"       # up to ~10 attempts…
-MINT_SLEEP="${MINT_SLEEP:-12}"       # …× ~12s ≈ 2 min total
-verify_direct() {
-  # Verify $1 against Core's DIRECT /api/ (the app's path). 200 = a valid token; sets HA_TOKEN + LAN_URL.
-  local tok="$1" code alt
-  code="$(curl -s -m 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${tok}" "${LAN_URL}/api/" 2>/dev/null || echo 000)"
-  if [[ "$code" == "200" ]]; then
-    HA_TOKEN="$tok"; echo "[hbot-connect] minted LLAT verified against Core DIRECT api (${LAN_URL}/api/ → 200)."; return 0
-  fi
-  # Fall back to the mDNS host if the primary-IP direct probe didn't reach Core (some routers block it).
-  alt="$(curl -s -m 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${tok}" "http://homeassistant.local:8123/api/" 2>/dev/null || echo 000)"
-  if [[ "$alt" == "200" ]]; then
-    HA_TOKEN="$tok"; LAN_URL="http://homeassistant.local:8123"
-    echo "[hbot-connect] minted LLAT verified against Core DIRECT api (homeassistant.local → 200)."; return 0
-  fi
-  MINT_ERROR="minted token did not authenticate against Core DIRECT /api/ (${LAN_URL}/api/ → ${code}, homeassistant.local → ${alt})"
-  return 1
-}
-i=1
-while [[ $i -le $MINT_TRIES ]]; do
-  # MINT_ATTEMPTS=1: this OUTER loop owns the retry cadence (MINT_SLEEP between tries). mint_llat.py now
-  # also creates a dedicated non-system user (idempotent) + logs in as it to mint a REAL LLAT, so one inner
-  # attempt per outer tick keeps total time bounded (~2 min) while Core finishes starting.
-  MINTED="$(MINT_ATTEMPTS=1 SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN:-${HASSIO_TOKEN:-}}" LLAT_CLIENT_NAME="HBot App" \
-            python3 /mint_llat.py 2>/tmp/mint_llat.err || true)"
-  if [[ -n "$MINTED" ]]; then
-    case "$MINTED" in eyJ*) : ;; *) echo "[hbot-connect] note: minted token is not a JWT (unexpected) — verifying directly anyway." ;; esac
-    if verify_direct "$MINTED"; then break; fi
-  else
-    MINT_ERROR="mint_llat.py returned no token: $(tail -n1 /tmp/mint_llat.err 2>/dev/null)"
-  fi
-  echo "[hbot-connect] token not ready (attempt ${i}/${MINT_TRIES}): ${MINT_ERROR}"
-  i=$((i + 1))
-  [[ $i -le $MINT_TRIES ]] && sleep "$MINT_SLEEP"
-done
-
-if [[ -z "$HA_TOKEN" ]]; then
-  # NEVER post an empty token (that's the autonomy-breaker: base_url written, token NULL → app stuck).
-  # Record the failure server-side so we can SEE why this box failed without Supervisor access, and make
-  # the reason loud in the add-on log. The full mint stderr is in /tmp/mint_llat.err.
-  MINT_ERROR="${MINT_ERROR:-unknown mint failure}"
-  MINT_DETAIL="$(tr '\n' ' ' </tmp/mint_llat.err 2>/dev/null | tail -c 600)"
-  echo "[hbot-connect] ================ TOKEN MINT FAILED ================"
-  echo "[hbot-connect] Could not mint+verify a Home Assistant token after ${MINT_TRIES} attempts."
-  echo "[hbot-connect] reason: ${MINT_ERROR}"
-  echo "[hbot-connect] mint_llat.py stderr: ${MINT_DETAIL}"
-  echo "[hbot-connect] NOT writing a token-less connection. Reporting a diagnostic to the server so the"
-  echo "[hbot-connect] app does NOT appear paired-but-tokenless. Common cause: the add-on's Core user is"
-  echo "[hbot-connect] not an owner/admin (HA refuses auth/long_lived_access_token for non-admins)."
-  echo "[hbot-connect] ==================================================="
-  # POST the diagnostic (no token). The server records mint_error and will NOT write base_url without a
-  # token (so the row never looks 'connected'). JSON-escape the reason (quotes/backslashes) crudely.
-  ESC_ERR="$(printf '%s' "${MINT_ERROR} | ${MINT_DETAIL}" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\n\r')"
-  curl -fsS -m 15 -X POST "${HBOT_CONNECT_URL}/provision" \
-    -H 'Content-Type: application/json' \
-    -H "X-Hbot-Provision-Token: ${PROV_TOKEN}" \
-    --data "{\"home_id\":\"${HOME_ID}\",\"mint_error\":\"${ESC_ERR}\"}" \
-    >/dev/null 2>&1 \
-    && echo "[hbot-connect] mint_error diagnostic recorded server-side." \
-    || echo "[hbot-connect] warn: could not record mint_error diagnostic (network?)."
-  # Keep the add-on alive for auto-update + the tunnel is pointless without Core auth; exit non-fatally so
-  # the Supervisor doesn't crash-loop us. A later boot (Core fully up / user made the add-on owner) retries.
-  exit 0
-fi
-
-# ── Zero-touch updates: turn ON the Supervisor auto-update for THIS add-on so non-technical clients
-# receive every future fix automatically (no terminal, no GitHub). Idempotent — runs on every boot,
-# so if the setting is ever cleared it self-heals. Uses SUPERVISOR_TOKEN DIRECTLY (the supervisor API is
-# the proxy path where that token is valid — NOT the app's HA_TOKEN, which is now a Core LLAT that is
-# deliberately NOT authorized for /api/hassio/). Non-fatal. (v1.4.4) ──
-SUP_TOKEN="${SUPERVISOR_TOKEN:-${HASSIO_TOKEN:-}}"
-if [[ -n "$SUP_TOKEN" ]]; then
-  if curl -fsS -m 10 -X POST -H "Authorization: Bearer ${SUP_TOKEN}" \
-       -H 'Content-Type: application/json' -d '{"auto_update": true}' \
-       "http://supervisor/addons/self/options" >/dev/null 2>&1; then
-    echo "[hbot-connect] auto-update ENABLED for this add-on — future versions install themselves."
-  else
-    echo "[hbot-connect] note: could not set auto-update automatically (leave it on in the add-on page). Continuing."
-  fi
-fi
-
-# ── Step 3: LAN FAST PATH — write base_url + token now so the app connects immediately, tunnel or not.
-echo "[hbot-connect] writing LAN connection (${LAN_URL}) for home ${HOME_ID}…"
-curl -fsS -m 12 -X POST "${HBOT_CONNECT_URL}/ha-connection" \
-  -H 'Content-Type: application/json' \
-  -H "X-Hbot-Provision-Token: ${PROV_TOKEN}" \
-  --data "{\"base_url\":\"${LAN_URL}\",\"access_token\":\"${HA_TOKEN}\"}" \
-  && echo "[hbot-connect] LAN connection written." \
-  || echo "[hbot-connect] warn: LAN connection write failed (non-fatal; /provision will retry the write)."
-
-# ── Step 4: provision the stable tunnel. Send access_token so the server also persists it alongside the
-# tunnel base_url (service-key write). Auth is PER-INSTALL: the server resolves the token to its home.
 echo "[hbot-connect] provisioning tunnel for home ${HOME_ID}…"
-RESP="$(curl -fsS -m 30 -X POST "${HBOT_CONNECT_URL}/provision" \
+# Auth is PER-INSTALL: the server resolves the token to its home and provisions only that home. A
+# compromised add-on can never provision another customer's home. Rotating the token revokes us.
+RESP="$(curl -fsS -X POST "${HBOT_CONNECT_URL}/provision" \
   -H 'Content-Type: application/json' \
   -H "X-Hbot-Provision-Token: ${PROV_TOKEN}" \
-  --data "{\"home_id\":\"${HOME_ID}\",\"access_token\":\"${HA_TOKEN}\"}")" || {
-    echo "[hbot-connect] tunnel provisioning failed — staying LAN-only (the app can already connect via ${LAN_URL})." >&2
-    exit 0
-  }
+  --data "{\"home_id\":\"${HOME_ID}\"}")"
 
 URL="$(echo "$RESP" | sed -n 's/.*"url":"\([^"]*\)".*/\1/p')"
-TUNNEL_TOKEN="$(echo "$RESP" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')"
-if [[ -z "$URL" || -z "$TUNNEL_TOKEN" ]]; then
-  echo "[hbot-connect] provisioning response missing url/token — staying LAN-only: $RESP" >&2
-  exit 0
+TOKEN="$(echo "$RESP" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')"
+if [[ -z "$URL" || -z "$TOKEN" ]]; then
+  echo "[hbot-connect] provisioning failed: $RESP" >&2
+  exit 1
 fi
 echo "$URL" > "$STATE_FILE"
 
-# ── Trust the tunnel proxy so HA doesn't 400 tunnelled requests. cloudflared routes to
-# homeassistant:8123 and adds X-Forwarded-For; HA returns "400 Bad Request" for forwarded headers
-# from an untrusted source unless http.use_x_forwarded_for + trusted_proxies are set. Without this the
-# tunnel connects healthy but every public request 400s. We write a config PACKAGE (never touching the
-# user's configuration.yaml) covering the hassio add-on docker network + loopback, then reload Core.
-ensure_trusted_proxies() {
-  local pkg_dir="/homeassistant/packages" pkg="/homeassistant/packages/hbot_tunnel.yaml"
-  # /homeassistant is the Core config dir mapped into the add-on (map: homeassistant_config:rw).
-  [[ -d /homeassistant ]] || { echo "[hbot-connect] warn: /homeassistant not mapped — cannot set trusted_proxies; tunnel may 400 until set manually."; return 0; }
-  mkdir -p "$pkg_dir" 2>/dev/null || true
-  # Only (re)write if missing/different, so we don't churn Core reloads on every boot.
-  local want='homeassistant:
-  packages: !include_dir_named packages'
-  # Ensure configuration.yaml includes packages (idempotent): if no "packages:" under homeassistant, add it.
-  if ! grep -qE '^\s*packages:\s*!include_dir_named\s+packages' /homeassistant/configuration.yaml 2>/dev/null; then
-    printf '\n# Added by HBot add-on so package files (incl. tunnel trusted_proxies) load.\nhomeassistant:\n  packages: !include_dir_named packages\n' >> /homeassistant/configuration.yaml 2>/dev/null || true
-  fi
-  # The proxy IP HA sees is the add-on's OWN source IP reaching Core. Because this add-on runs with
-  # host_network: true, cloudflared reaches homeassistant:8123 from the HOST's LAN IP (e.g. 192.168.1.x),
-  # NOT a 172.30.x docker address — so we must trust the real LAN_IP computed above, plus its /24 and
-  # loopback as a safety net. (Getting this wrong = HA 400s every tunnel request.)
-  local host_ip="${LAN_IP:-}"
-  local host_net=""
-  if [[ "$host_ip" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.[0-9]+$ ]]; then host_net="${BASH_REMATCH[1]}.0/24"; fi
-  {
-    echo "# Managed by the HBot add-on — trusts the cloudflared tunnel proxy so remote (tunnel)"
-    echo "# requests are not rejected with 400. Host-network add-on → trust the host LAN IP."
-    echo "http:"
-    echo "  use_x_forwarded_for: true"
-    echo "  trusted_proxies:"
-    [[ -n "$host_ip"  ]] && echo "    - $host_ip"
-    [[ -n "$host_net" ]] && echo "    - $host_net"
-    echo "    - 172.30.32.0/23"
-    echo "    - 127.0.0.1"
-    echo "    - ::1"
-  } > "$pkg" 2>/dev/null || true
-  echo "[hbot-connect] wrote trusted_proxies package; reloading Core config…"
-  # Validate + reload via Core service (no full restart needed for http trusted_proxies? http needs a
-  # restart — so request a Core restart, which HA schedules gracefully).
-  curl -fsS -m 10 -X POST -H "Authorization: Bearer ${HA_TOKEN}" \
-    "http://supervisor/core/api/services/homeassistant/restart" -H 'Content-Type: application/json' -d '{}' \
-    >/dev/null 2>&1 && echo "[hbot-connect] Core restart requested to apply trusted_proxies." \
-    || echo "[hbot-connect] warn: Core restart request failed — trusted_proxies will apply on next HA restart."
-}
-ensure_trusted_proxies
+# Write the URL back to Supabase ha_connections for this home (PostgREST upsert with anon key; RLS
+# permits the paired home to update its own row). The app's loadHaConnection() reads base_url — done.
+if [[ -n "${SUPABASE_URL:-}" && -n "${SUPABASE_ANON_KEY:-}" ]]; then
+  curl -fsS -X PATCH "${SUPABASE_URL}/rest/v1/ha_connections?home_id=eq.${HOME_ID}" \
+    -H "apikey: ${SUPABASE_ANON_KEY}" \
+    -H "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
+    -H 'Content-Type: application/json' \
+    -H 'Prefer: return=minimal' \
+    --data "{\"base_url\":\"${URL}\"}" || echo "[hbot-connect] warn: URL write-back failed (non-fatal)"
+fi
 
 echo "[hbot-connect] starting cloudflared → ${URL}"
-# ── Cloudflare 530/1033 self-heal ──────────────────────────────────────────────
-# Two failure modes must both be covered:
-#   (a) cloudflared PROCESS EXITS (network blip, CF edge hiccup, CGNAT re-NAT) —
-#       the outer supervised retry loop below reconnects with capped backoff.
-#   (b) cloudflared stays ALIVE but its edge/named-tunnel connections go DEAD
-#       (Cloudflare 1033 = "no connected origin"). The process never exits, so the
-#       retry loop in (a) NEVER fires and the app sees 530/1033 forever. This is the
-#       real production bug.
+
+# ── SUPERVISED TUNNEL (permanent self-heal, 2026-08-29) ────────────────────────────────────────────
+# The previous line was a terminal `exec cloudflared … run` with NO supervision. When cloudflared
+# de-registers its origin (network blip, CGNAT re-NAT, CF edge hiccup) the LOCAL PROCESS STAYS ALIVE
+# while the public tunnel is DEAD — Cloudflare's edge then serves HTTP 530 / "error code: 1033" and
+# nothing respawns it, so every HA tile goes Offline until the operator manually restarts the add-on.
+# This has recurred 5×. Restarting only on PROCESS EXIT (the old while-true loop in the legacy copy) is
+# NOT enough: the process does not exit in this failure. The ONLY authoritative signal is an END-TO-END
+# probe of the PUBLIC endpoint. So: run cloudflared in the background, probe ${URL}/api/ every 30s, and
+# on 2 CONSECUTIVE public failures force-kill (-9) cloudflared and relaunch it. Loop forever while paired.
 #
-# v1.4.22 — END-TO-END PUBLIC PROBE. The v1.4.6/1.4.20 watchdog probed ONLY cloudflared's
-# LOCAL /ready + /metrics. That reflects the CONNECTOR's own view ("do I think I have edge
-# connections") — but the recurring outage (4th today) is the origin DE-REGISTERING at the
-# Cloudflare edge while the connector process stays alive and can even still report /ready=200.
-# In that state the LOCAL signals look healthy but the PUBLIC URL returns 530/1033 and the
-# customer sees "HA disconnected". The only signal that catches this is fetching the PUBLIC
-# tunnel URL from the internet and checking the real end-to-end response.
-#
-# We now run TWO independent checks each cycle:
-#   • PUBLIC (authoritative): GET ${URL}/api/ over the internet. HA rejects unauthenticated
-#     /api/ with 401 → 401 means the tunnel is alive AND reaching Core end-to-end (this is the
-#     exact success signal the ops runbook uses). 200 also counts as reachable. A CF-edge
-#     failure returns 530/1033/502/000/timeout = origin not connected → count a failure.
-#   • LOCAL (secondary): the old /ready + /metrics scrape, kept as a fast corroborating signal.
-# Two consecutive PUBLIC failures (default) force-kill cloudflared → the (a) retry loop respawns
-# it and the origin re-registers within seconds. Every detection + kill is logged with a UTC
-# timestamp so we can prove the watchdog fired.
+# POSIX/bash, Alpine-safe: only kill, sleep, curl, date, and shell builtins.
 
-METRICS_PORT=36429   # cloudflared /ready + /metrics served locally on this port
-WD_INTERVAL=30       # seconds between health probes
-WD_FAIL_LIMIT=2      # consecutive PUBLIC-dead probes before we kill (rides out one transient blip)
-WD_PUBLIC_URL="$URL" # the public tunnel URL provisioned above (also in $STATE_FILE)
+TS() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 
-ts() { date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo '?'; }
-
-# public_probe — GET the PUBLIC tunnel URL end-to-end (through the CF edge). Echoes the HTTP code.
-# 401 or 200 on /api/ ⇒ healthy origin. 530/1033/502/000/timeout ⇒ origin de-registered/dead.
-public_probe() {
-  [ -n "$WD_PUBLIC_URL" ] || { echo 000; return; }
-  curl -s -o /dev/null -w '%{http_code}' -m 10 "${WD_PUBLIC_URL}/api/" 2>/dev/null || echo 000
+# Log the heartbeat back to hbot-connect on each HEALTHY probe (best-effort, non-fatal). This gives us
+# OFF-BOX observability that does NOT depend on this dying add-on process (backend GET /tunnel-health).
+heartbeat() {
+  # $1 = http status observed on the public probe
+  [ -n "${HBOT_CONNECT_URL:-}" ] || return 0
+  curl -fsS -m 8 -X POST "${HBOT_CONNECT_URL}/tunnel-health" \
+    -H 'Content-Type: application/json' \
+    -H "X-Hbot-Provision-Token: ${PROV_TOKEN}" \
+    --data "{\"home_id\":\"${HOME_ID}\",\"status\":\"${1}\",\"url\":\"${URL}\"}" \
+    >/dev/null 2>&1 || true
 }
 
-# local_healthy — cloudflared's own view (fast corroboration). Returns 0 if it looks connected.
-local_healthy() {
-  local code body conns
-  code=$(curl -s -o /dev/null -w '%{http_code}' -m 8 "http://127.0.0.1:${METRICS_PORT}/ready" 2>/dev/null)
-  [ "$code" = "200" ] && return 0
-  if [ -z "$code" ] || [ "$code" = "000" ]; then
-    body=$(curl -s -m 8 "http://127.0.0.1:${METRICS_PORT}/metrics" 2>/dev/null)
-    conns=$(printf '%s\n' "$body" | awk '/^cloudflared_tunnel_ha_connections /{s+=$2} END{print s+0}')
-    [ "${conns:-0}" -gt 0 ] && return 0
-  fi
-  return 1
+start_cloudflared() {
+  # --retries/--grace-period make cloudflared hold onto a connection harder before giving up; the outer
+  # public-probe watchdog covers the case where it silently keeps a dead origin.
+  cloudflared tunnel --no-autoupdate --retries 10 --grace-period 30s run --token "$TOKEN" &
+  CF_PID=$!
+  echo "[hbot-connect] $(TS) cloudflared started pid=${CF_PID} → ${URL}"
 }
 
-# health_watchdog <cloudflared_pid> — probes the PUBLIC tunnel URL end-to-end (authoritative) and
-# kills the tunnel when the public edge is dead-but-process-alive so the supervisor respawns it.
-health_watchdog() {
-  local pid="$1" fails=0 pcode
-  # Give cloudflared a moment to bind the metrics server + establish first edge connections and
-  # for DNS/ingress to propagate before the first PUBLIC probe.
-  sleep 25
-  while kill -0 "$pid" 2>/dev/null; do
-    sleep "$WD_INTERVAL"
-    kill -0 "$pid" 2>/dev/null || break   # process exited → (a) loop handles it.
-    # AUTHORITATIVE signal: the public URL, end-to-end through the CF edge.
-    pcode="$(public_probe)"
-    case "$pcode" in
-      200|401|403)
-        # Reachable end-to-end (401/403 = HA answered = origin connected). Healthy.
-        fails=0
-        continue
-        ;;
-    esac
-    # Public probe failed. If cloudflared's LOCAL view is ALSO unhealthy, that's a strong signal;
-    # either way a failing PUBLIC probe is what the customer experiences, so we count it.
-    if local_healthy; then
-      echo "[hbot-connect] watchdog $(ts): PUBLIC probe failed (code=${pcode}) but connector /ready looks up — likely edge de-register; fails=$(( fails + 1 ))/${WD_FAIL_LIMIT}"
-    else
-      echo "[hbot-connect] watchdog $(ts): PUBLIC probe failed (code=${pcode}) and connector /ready down too; fails=$(( fails + 1 ))/${WD_FAIL_LIMIT}"
-    fi
-    fails=$(( fails + 1 ))
-    if [ "$fails" -ge "$WD_FAIL_LIMIT" ]; then
-      echo "[hbot-connect] watchdog $(ts): tunnel dead end-to-end (last public code=${pcode}) — killing cloudflared pid=${pid} to force origin re-registration."
-      kill "$pid" 2>/dev/null
-      sleep 3
-      kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
-      return   # cloudflared will exit → outer loop respawns it (and a new watchdog).
-    fi
-  done
+# Probe the PUBLIC endpoint end-to-end. Returns 0 = healthy, 1 = failure.
+# Healthy = any HTTP status that proves a live origin answered (200 or 401 — HA auth challenge both mean
+# cloudflared delivered the request to Core). Failure = 530/502/000/timeout, OR a body containing
+# "error code: 1033" (Cloudflare's no-origin page, which can arrive with a 530 or occasionally a 200-ish
+# edge response). We must inspect the BODY, not only the code, because 1033 is the definitive dead-origin tell.
+probe_public() {
+  _body="$(curl -s -m 12 "${URL}/api/" 2>/dev/null)"
+  _code="$(curl -s -o /dev/null -m 12 -w '%{http_code}' "${URL}/api/" 2>/dev/null || echo 000)"
+  case "$_body" in
+    *"error code: 1033"*) return 1 ;;   # Cloudflare "no origin" — definitive tunnel death
+  esac
+  case "$_code" in
+    200|401|403) return 0 ;;             # a live origin answered (auth-gated is fine)
+    *) return 1 ;;                       # 530/502/000/timeout/etc = origin not reachable via edge
+  esac
 }
 
-# Supervised retry loop covering failure mode (a); the watchdog covers (b).
-backoff=2
+start_cloudflared
+fails=0
+last_reported=""   # "ok" / "fail" — heartbeat ONLY on state change (keeps backend traffic tiny fleet-wide)
+# Give cloudflared a moment to register its first connection before the first public probe.
+sleep 20
 while true; do
-  # --metrics binds the local liveness server the watchdog probes.
-  cloudflared tunnel --no-autoupdate --retries 10 --grace-period 30s \
-    --metrics "127.0.0.1:${METRICS_PORT}" run --token "$TUNNEL_TOKEN" &
-  cf_pid=$!
-  echo "[hbot-connect] cloudflared started pid=${cf_pid} (metrics 127.0.0.1:${METRICS_PORT})"
-  health_watchdog "$cf_pid" &
-  wd_pid=$!
-  wait "$cf_pid"          # blocks until cloudflared exits (crash, or watchdog kill)
-  rc=$?
-  kill "$wd_pid" 2>/dev/null   # retire this cloudflared's watchdog; a fresh one starts next iteration.
-  echo "[hbot-connect] cloudflared exited rc=$rc — reconnecting in ${backoff}s (tunnel auto-heal)."
-  sleep "$backoff"
-  # exponential backoff capped at 60s so a persistent outage doesn't hammer the CF edge.
-  backoff=$(( backoff * 2 )); [ "$backoff" -gt 60 ] && backoff=60
+  if probe_public; then
+    if [ "$fails" -ne 0 ]; then echo "[hbot-connect] $(TS) public probe recovered (${URL}/api/ healthy)."; fi
+    fails=0
+    if [ "$last_reported" != "ok" ]; then heartbeat "ok"; last_reported="ok"; fi
+  else
+    fails=$(( fails + 1 ))
+    echo "[hbot-connect] $(TS) public probe FAILED (${URL}/api/ → code=${_code}, 1033-body=$(case "$_body" in *'error code: 1033'*) echo yes;; *) echo no;; esac)) — consecutive=${fails}."
+    if [ "$last_reported" != "fail" ]; then heartbeat "fail"; last_reported="fail"; fi
+    if [ "$fails" -ge 2 ]; then
+      # Do NOT trust the local PID being alive — the process stays 'up' while the origin is de-registered.
+      # Only the public probe is authoritative, so on 2 consecutive public failures we force-kill + relaunch.
+      echo "[hbot-connect] $(TS) 2 consecutive public failures — force-killing cloudflared pid=${CF_PID} and relaunching (tunnel auto-heal)."
+      kill -9 "$CF_PID" 2>/dev/null || true
+      wait "$CF_PID" 2>/dev/null || true
+      # If cloudflared already died on its own, reap any stragglers too.
+      pkill -9 -f 'cloudflared tunnel' 2>/dev/null || true
+      sleep 2
+      start_cloudflared
+      fails=0
+      sleep 20   # let the fresh process register before probing again
+      continue
+    fi
+  fi
+  # If cloudflared exited entirely (not just origin-dead), relaunch immediately regardless of probe count.
+  if ! kill -0 "$CF_PID" 2>/dev/null; then
+    echo "[hbot-connect] $(TS) cloudflared process exited — relaunching."
+    pkill -9 -f 'cloudflared tunnel' 2>/dev/null || true
+    sleep 1
+    start_cloudflared
+    fails=0
+    sleep 20
+    continue
+  fi
+  sleep 30
 done
