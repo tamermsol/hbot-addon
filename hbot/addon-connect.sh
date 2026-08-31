@@ -62,24 +62,44 @@ fi
 
 echo "[hbot-connect] starting cloudflared → ${URL}"
 
-# ── SUPERVISED TUNNEL (permanent self-heal, 2026-08-29) ────────────────────────────────────────────
+# ── SUPERVISED TUNNEL (permanent self-heal, v2 — LOCAL edge-liveness probe, 2026-08-31) ─────────────
 # The previous line was a terminal `exec cloudflared … run` with NO supervision. When cloudflared
 # de-registers its origin (network blip, CGNAT re-NAT, CF edge hiccup) the LOCAL PROCESS STAYS ALIVE
 # while the public tunnel is DEAD — Cloudflare's edge then serves HTTP 530 / "error code: 1033" and
 # nothing respawns it, so every HA tile goes Offline until the operator manually restarts the add-on.
 # This has recurred 5×. Restarting only on PROCESS EXIT (the old while-true loop in the legacy copy) is
-# NOT enough: the process does not exit in this failure. The ONLY authoritative signal is an END-TO-END
-# probe of the PUBLIC endpoint. So: run cloudflared in the background, probe ${URL}/api/ every 30s, and
-# on 2 CONSECUTIVE public failures force-kill (-9) cloudflared and relaunch it. Loop forever while paired.
+# NOT enough: the process does not exit in this failure.
 #
-# POSIX/bash, Alpine-safe: only kill, sleep, curl, date, and shell builtins.
+# The v1 fix (2026-08-29) probed only the PUBLIC endpoint (${URL}/api/). That detects the dead edge but
+# it's slow, noisy (CGNAT/DNS/CF-edge jitter can 530 a *healthy* box), and — critically — the public
+# page can still 530 for reasons OTHER than a hung cloudflared, so it's a weak trigger for force-recycle.
+#
+# v2 adds the AUTHORITATIVE local signal: cloudflared's own metrics server. We launch it with
+# `--metrics 127.0.0.1:${CF_METRICS_PORT}` and probe `GET /ready` on loopback. `/ready` returns HTTP 200
+# with a JSON body `{"status":200,"readyConnections":N,...}` ONLY while ≥1 edge connection is registered;
+# when the edge registration drops (the exact 530/1033 failure) `/ready` flips to HTTP 503 while the
+# process is still alive. That is the dead-edge-but-alive case the old loop missed — detected LOCALLY, in
+# milliseconds, with no dependency on the public URL. (Older cloudflared builds lack /ready; we fall back
+# to scraping `/metrics` for the `cloudflared_tunnel_ha_connections` gauge — >0 = edge registered.)
+#
+# Health decision each cycle:
+#   PRIMARY   = local metrics /ready (edge registered?)         ← force-recycle trigger
+#   SECONDARY = public ${URL}/api/ for 530 / "error code: 1033" ← corroborating end-to-end signal
+# UNHEALTHY = metrics says edge NOT registered, OR public says 530/1033. On N (=2) CONSECUTIVE unhealthy
+# cycles we force-kill (-9) cloudflared and relaunch it with the same token. Every healthy↔unhealthy
+# transition and every respawn is logged with a UTC timestamp. Loops forever while paired (never exit 0).
+#
+# POSIX/bash, Alpine-safe: only kill, sleep, curl, date, grep, and shell builtins.
+
+CF_METRICS_PORT="${CF_METRICS_PORT:-36429}"   # loopback-only cloudflared metrics/ready server
+CF_METRICS="127.0.0.1:${CF_METRICS_PORT}"
 
 TS() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 
-# Log the heartbeat back to hbot-connect on each HEALTHY probe (best-effort, non-fatal). This gives us
+# Log the heartbeat back to hbot-connect on each state change (best-effort, non-fatal). This gives us
 # OFF-BOX observability that does NOT depend on this dying add-on process (backend GET /tunnel-health).
 heartbeat() {
-  # $1 = http status observed on the public probe
+  # $1 = "ok" / "fail" state observed by the supervisor
   [ -n "${HBOT_CONNECT_URL:-}" ] || return 0
   curl -fsS -m 8 -X POST "${HBOT_CONNECT_URL}/tunnel-health" \
     -H 'Content-Type: application/json' \
@@ -89,18 +109,47 @@ heartbeat() {
 }
 
 start_cloudflared() {
-  # --retries/--grace-period make cloudflared hold onto a connection harder before giving up; the outer
-  # public-probe watchdog covers the case where it silently keeps a dead origin.
-  cloudflared tunnel --no-autoupdate --retries 10 --grace-period 30s run --token "$TOKEN" &
+  # --metrics exposes the LOCAL /ready + /metrics edge-liveness server on loopback (v2 primary probe).
+  # --retries/--grace-period make cloudflared hold onto a connection harder before giving up; the
+  # supervisor covers the case where it silently keeps a dead origin.
+  cloudflared tunnel --no-autoupdate --metrics "$CF_METRICS" \
+    --retries 10 --grace-period 30s run --token "$TOKEN" &
   CF_PID=$!
-  echo "[hbot-connect] $(TS) cloudflared started pid=${CF_PID} → ${URL}"
+  echo "[hbot-connect] $(TS) cloudflared started pid=${CF_PID} (metrics ${CF_METRICS}) → ${URL}"
 }
 
-# Probe the PUBLIC endpoint end-to-end. Returns 0 = healthy, 1 = failure.
-# Healthy = any HTTP status that proves a live origin answered (200 or 401 — HA auth challenge both mean
-# cloudflared delivered the request to Core). Failure = 530/502/000/timeout, OR a body containing
-# "error code: 1033" (Cloudflare's no-origin page, which can arrive with a 530 or occasionally a 200-ish
-# edge response). We must inspect the BODY, not only the code, because 1033 is the definitive dead-origin tell.
+# PRIMARY probe — cloudflared's OWN edge-liveness, read locally over loopback. Returns:
+#   0 = edge registered (≥1 ready connection)   1 = edge NOT registered (dead-edge-but-alive)
+#   2 = indeterminate (metrics server not answering yet — e.g. just launched; don't treat as failure)
+# Prefer /ready (HTTP 200 = ready, 503 = not ready). Fall back to the /metrics ha_connections gauge for
+# cloudflared builds that don't serve /ready. curl exit 7 (conn refused) while the process is alive =
+# metrics server still warming up → indeterminate, not a failure.
+probe_metrics() {
+  _rcode="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://${CF_METRICS}/ready" 2>/dev/null)"
+  _rc=$?
+  if [ "$_rc" -eq 0 ] && [ -n "$_rcode" ]; then
+    case "$_rcode" in
+      200) return 0 ;;   # edge registered
+      503) return 1 ;;   # cloudflared alive but NO edge connection — the failure we must heal
+      404) : ;;          # this build has no /ready — fall through to /metrics gauge
+      *)   : ;;          # any other code: fall through to /metrics before deciding
+    esac
+  fi
+  # Fallback: scrape the connections gauge. >0 = registered, ==0 = dead edge, no output = server not up.
+  _m="$(curl -s -m 5 "http://${CF_METRICS}/metrics" 2>/dev/null \
+        | grep -E '^cloudflared_tunnel_ha_connections ' | tail -n1 | awk '{print $2}')"
+  if [ -z "$_m" ]; then return 2; fi          # metrics server not answering → indeterminate
+  case "$_m" in
+    0|0.0|0.00) return 1 ;;                    # zero HA connections = dead edge
+    *) return 0 ;;                             # non-zero = edge registered
+  esac
+}
+
+# SECONDARY probe — the PUBLIC endpoint end-to-end. Returns 0 = healthy, 1 = failure.
+# Healthy = any HTTP status that proves a live origin answered (200/401/403 — HA auth challenge counts).
+# Failure = 530/502/000/timeout, OR a body containing "error code: 1033" (Cloudflare's no-origin page,
+# which can arrive with a 530 or occasionally a 200-ish edge response). We inspect the BODY, not only the
+# code, because 1033 is the definitive dead-origin tell.
 probe_public() {
   _body="$(curl -s -m 12 "${URL}/api/" 2>/dev/null)"
   _code="$(curl -s -o /dev/null -m 12 -w '%{http_code}' "${URL}/api/" 2>/dev/null || echo 000)"
@@ -113,24 +162,44 @@ probe_public() {
   esac
 }
 
+# Combined health for one cycle. Sets $why (human-readable reason) and returns 0=healthy / 1=unhealthy.
+# UNHEALTHY iff the LOCAL edge probe says edge-not-registered (return 1) OR the public probe says 530/1033.
+# An indeterminate metrics result (return 2, server warming up) is NOT counted as a failure on its own —
+# we defer to the public probe in that window so a just-launched process isn't force-killed prematurely.
+probe_health() {
+  probe_metrics; _mrc=$?
+  if [ "$_mrc" -eq 1 ]; then
+    why="local /ready reports edge NOT registered (readyConnections=0) while process alive"
+    return 1
+  fi
+  if probe_public; then
+    if [ "$_mrc" -eq 0 ]; then why="edge registered (/ready 200) + public ${URL}/api/ code=${_code}"; \
+    else why="public ${URL}/api/ code=${_code} healthy (metrics indeterminate)"; fi
+    return 0
+  fi
+  why="public ${URL}/api/ code=${_code} 1033-body=$(case "$_body" in *'error code: 1033'*) echo yes;; *) echo no;; esac) (metrics rc=${_mrc})"
+  return 1
+}
+
 start_cloudflared
 fails=0
 last_reported=""   # "ok" / "fail" — heartbeat ONLY on state change (keeps backend traffic tiny fleet-wide)
-# Give cloudflared a moment to register its first connection before the first public probe.
+# Give cloudflared a moment to register its first connection + bring up its metrics server before probing.
 sleep 20
 while true; do
-  if probe_public; then
-    if [ "$fails" -ne 0 ]; then echo "[hbot-connect] $(TS) public probe recovered (${URL}/api/ healthy)."; fi
+  if probe_health; then
+    if [ "$fails" -ne 0 ]; then echo "[hbot-connect] $(TS) HEALTHY again — ${why}."; fi
     fails=0
     if [ "$last_reported" != "ok" ]; then heartbeat "ok"; last_reported="ok"; fi
   else
     fails=$(( fails + 1 ))
-    echo "[hbot-connect] $(TS) public probe FAILED (${URL}/api/ → code=${_code}, 1033-body=$(case "$_body" in *'error code: 1033'*) echo yes;; *) echo no;; esac)) — consecutive=${fails}."
+    echo "[hbot-connect] $(TS) UNHEALTHY — ${why} — consecutive=${fails}."
     if [ "$last_reported" != "fail" ]; then heartbeat "fail"; last_reported="fail"; fi
     if [ "$fails" -ge 2 ]; then
       # Do NOT trust the local PID being alive — the process stays 'up' while the origin is de-registered.
-      # Only the public probe is authoritative, so on 2 consecutive public failures we force-kill + relaunch.
-      echo "[hbot-connect] $(TS) 2 consecutive public failures — force-killing cloudflared pid=${CF_PID} and relaunching (tunnel auto-heal)."
+      # The local /ready probe (primary) or public 530/1033 (secondary) is authoritative, so on 2
+      # consecutive unhealthy cycles we force-kill + relaunch to re-register a fresh edge connection.
+      echo "[hbot-connect] $(TS) 2 consecutive unhealthy cycles — force-killing cloudflared pid=${CF_PID} and relaunching (tunnel auto-heal)."
       kill -9 "$CF_PID" 2>/dev/null || true
       wait "$CF_PID" 2>/dev/null || true
       # If cloudflared already died on its own, reap any stragglers too.
@@ -138,7 +207,7 @@ while true; do
       sleep 2
       start_cloudflared
       fails=0
-      sleep 20   # let the fresh process register before probing again
+      sleep 20   # let the fresh process register + bring metrics back up before probing again
       continue
     fi
   fi
@@ -152,5 +221,5 @@ while true; do
     sleep 20
     continue
   fi
-  sleep 30
+  sleep 25
 done

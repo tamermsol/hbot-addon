@@ -1,5 +1,22 @@
 # HBot Add-on Changelog
 
+## 1.4.24
+- **Tunnel supervisor now uses the LOCAL edge-liveness probe as its primary trigger, PLUS the public
+  probe as corroboration.** v1.4.22 switched to a public-only probe because in one failure mode
+  cloudflared's `/ready` reported 200 while the public URL was dead. But the public probe alone is slow
+  and noisy (CGNAT/DNS/CF-edge jitter can 530 a healthy box) and a 530 has causes other than a hung
+  connector. v1.4.24 launches cloudflared with `--metrics 127.0.0.1:36429` and probes `GET /ready`
+  locally: HTTP 200 = edge registered, **HTTP 503 = process alive but NO edge connection** — the exact
+  dead-edge-but-alive failure the process-exit loop misses, now caught in milliseconds without touching
+  the public URL (older builds without `/ready` fall back to scraping the `ha_connections` gauge from
+  `/metrics`). A cycle is UNHEALTHY when the local probe says edge-not-registered **OR** the public
+  `${tunnel}/api/` returns 530 / `error code: 1033`; on 2 consecutive unhealthy cycles the supervisor
+  force-kills (`-9`) cloudflared and relaunches it with the same token so the edge re-registers within
+  seconds. Every healthy↔unhealthy transition and every respawn is logged with a UTC timestamp. This
+  combines the strengths of the v1.4.20 local probe and the v1.4.22 public probe (union of both), so
+  neither a `/ready`-lies-healthy case nor a slow-public case can hide a dead tunnel.
+
+
 ## 1.4.22
 - **Tunnel watchdog now probes the PUBLIC URL end-to-end.** The previous watchdog checked only
   cloudflared's LOCAL `/ready` + `/metrics`, which reflect the connector's own view. The recurring
