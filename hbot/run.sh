@@ -35,6 +35,20 @@ export HBOT_DEBUG="$DEBUG"
 export HBOT_ACCOUNT_EMAIL="$ACCOUNT_EMAIL"
 export HBOT_ACCOUNT_PASSWORD="$ACCOUNT_PASSWORD"
 
+# ── Ensure <config>/www/ exists BEFORE Core scans it at startup (fresh-install /local fix) ──────────
+# HA registers the /local static route ONLY at Core startup, and ONLY if <config>/www/ exists then. On a
+# brand-new install www/ doesn't exist, so /local is never mounted and the add-on's pairing nonce (written
+# post-boot) 404s forever — the root of the 99-commit pairing dead-end. Creating www/ here, before the
+# bridge/pairing run, means on the NEXT Core start /local mounts natively. (addon-claim.sh additionally
+# forces a reload/restart THIS boot, and the bridge serves the nonce at :8098 as a mount-independent
+# fallback — belt and suspenders.) The config dir is mounted at /homeassistant (current) or /config.
+for _cfg in /homeassistant /config; do
+  if [[ -d "$_cfg" ]]; then
+    mkdir -p "$_cfg/www" 2>/dev/null && bashio::log.info "ensured ${_cfg}/www exists so HA registers /local at Core startup." || true
+    break
+  fi
+done
+
 # ── Optional remote access: open a Cloudflare tunnel if this HA is paired to a home (BURDEN 1) ──
 # Runs in the BACKGROUND and is fully non-fatal — if unpaired or provisioning fails, the add-on keeps
 # working LAN-only. cloudflared holds the tunnel open; the bridge is the foreground process below.

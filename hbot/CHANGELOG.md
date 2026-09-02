@@ -1,5 +1,28 @@
 # HBot Add-on Changelog
 
+## 1.4.25
+- **Permanent fix for the fresh-box pairing dead-end (registered claim never binds → `ha_connections`
+  stays empty → app shows "install the add-on" forever).** Root cause: Home Assistant registers the
+  `/local` static route ONLY at Core startup and ONLY if `<config>/www/` exists then. On a brand-new
+  install `www/` doesn't exist at boot, so `/local` is never mounted; the add-on writes the pairing
+  nonce to `www/hbot_pair_nonce.txt` AFTER boot, so `GET /local/hbot_pair_nonce.txt` returns a plain 404
+  indefinitely. The app can't read the nonce → can't echo it → hbot-connect's proof-of-LAN auto-bind
+  (`sha256(echo) == nonce_hash`) never fires → the claim stays `pending`. Three independent fixes make a
+  registered claim ALWAYS bindable:
+  - `addon-claim.sh` now, after publishing the nonce, forces HA to expose `/local` this boot: it POSTs
+    `homeassistant.reload_core_config` (via the add-on's `SUPERVISOR_TOKEN`) to re-register the static
+    mount, verifies `GET …/local/hbot_pair_nonce.txt` returns 200 with the nonce, and if it's still 404
+    falls back to a **guarded one-time** Core `restart` (a `/data` flag prevents any restart loop; the
+    flag is cleared once pairing completes).
+  - The bridge now serves the SAME nonce from its own already-running proxy on **:8098 at
+    `/hbot_pair_nonce`**, INDEPENDENT of HA's `/local` mount, so the app can bind even when `/local` is
+    dead. The app-side `readHaPairNonce` tries `/local` first, then this `:8098` fallback.
+  - `run.sh` now creates `<config>/www/` at startup BEFORE Core scans it, so future fresh installs
+    register `/local` natively on the next Core start.
+  - Net effect: after the operator installs+Starts the add-on ONCE, pairing completes with zero further
+    taps — the nonce is reachable at `/local` (post reload) OR at `:8098/hbot_pair_nonce` (proxy), the
+    app echoes it, hbot-connect binds, and the `ha_connections` row is written.
+
 ## 1.4.24
 - **Tunnel supervisor now uses the LOCAL edge-liveness probe as its primary trigger, PLUS the public
   probe as corroboration.** v1.4.22 switched to a public-only probe because in one failure mode

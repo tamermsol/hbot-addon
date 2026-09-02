@@ -692,7 +692,43 @@ def _start_core_proxy():
                     except Exception:
                         return
 
+        def _serve_pair_nonce(self):
+            # Serve the LAN pairing nonce from the add-on's OWN port, INDEPENDENT of HA's /local static
+            # mount. On a fresh HA install /local is never registered at boot (www/ didn't exist), so
+            # <base>/local/hbot_pair_nonce.txt 404s and the app can't complete the 0-tap bind. This
+            # fallback path lets the app read the exact same nonce straight from the add-on (which wrote
+            # it to /data/pair_nonce), so pairing works even when /local is dead. No auth: the nonce is a
+            # proof-of-LAN-possession token, not a secret — only a client on this LAN/tunnel can reach it,
+            # which is exactly the co-location proof hbot-connect requires (identical to the /local file).
+            try:
+                with open("/data/pair_nonce", "r") as f:
+                    nonce = f.read().strip()
+            except Exception:
+                nonce = ""
+            _n = nonce or ""
+            _is_hex_nonce = (32 <= len(_n) <= 128
+                             and all(c in "0123456789abcdefABCDEF" for c in _n))
+            if not _is_hex_nonce:
+                # No live pairing in progress (already paired → nonce retired, or not written yet).
+                self.send_error(404, "no pairing nonce")
+                return
+            body = nonce.encode("ascii")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                log(f"proxy GET /hbot_pair_nonce → 200 (served nonce fallback, /local-independent)")
+            except Exception as e:
+                log(f"proxy GET /hbot_pair_nonce write error: {e}")
+
         def do_GET(self):
+            # Add-on-served pairing nonce (fallback for a dead HA /local mount — see _serve_pair_nonce).
+            if self.path.split("?", 1)[0] == "/hbot_pair_nonce":
+                self._serve_pair_nonce()
+                return
             # WebSocket upgrade on /api/websocket → live-state bridge; everything else → HTTP proxy.
             if (self.path.startswith("/api/websocket")
                     and "websocket" in (self.headers.get("Upgrade", "").lower())):

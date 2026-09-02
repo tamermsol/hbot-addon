@@ -82,6 +82,7 @@ persist_if_approved() {
   printf '%s' "$hid" > "$HOME_ID_FILE"
   rm -f "$CODE_FILE"
   rm -f "$NONCE_FILE" /homeassistant/www/hbot_pair_nonce.txt /config/www/hbot_pair_nonce.txt 2>/dev/null || true
+  rm -f /data/.local_mount_restarted 2>/dev/null || true  # reset the one-time restart guard so a future re-pair on this box can restart Core again if needed
   return 0
 }
 if persist_if_approved; then
@@ -129,6 +130,68 @@ publish_nonce() {
   return 1
 }
 publish_nonce || true
+
+# ── Force HA to actually SERVE /local (the 99-commit invisible failure) ───────────────────────────────
+# HA registers the /local StaticPathConfig ONLY at Core STARTUP, by scanning <config>/www/. On a FRESH
+# install www/ does not exist at boot, so Core never mounts /local — and publish_nonce() above writes the
+# file AFTER boot, so HA serves a plain 404 for /local/hbot_pair_nonce.txt (and for ANY /local/* path)
+# forever. The app then can't read the nonce → can't echo it → hbot-connect never auto-binds → the claim
+# stays pending → ha_connections stays empty. This stranded every fresh box. Fix: after writing www/, ask
+# Core (via the add-on's SUPERVISOR_TOKEN — homeassistant_api:true) to reload its core config, which
+# re-registers the static /local mount without a full restart. Verify by fetching the nonce; if it's still
+# 404 after reload, fall back to a full Core restart, GUARDED to at most once per pairing so we never loop.
+SUP_TOKEN="${SUPERVISOR_TOKEN:-${HASSIO_TOKEN:-}}"
+NONCE_URL="${HA_DISCOVER_URL:-http://homeassistant:8123}/local/hbot_pair_nonce.txt"
+RESTART_FLAG="/data/.local_mount_restarted"
+
+nonce_served_200() {
+  # Returns 0 iff /local/hbot_pair_nonce.txt returns 200 with the exact 64-hex nonce (proves /local is
+  # mounted AND the file is served). Any non-200 / body mismatch → non-zero.
+  local body
+  body="$(curl -fsS -m 8 "$NONCE_URL" 2>/dev/null || echo '')"
+  [[ "$body" == "$NONCE" ]]
+}
+
+ensure_local_mount() {
+  # Already served? Nothing to do (e.g. www/ existed at boot, or a prior reload took).
+  if nonce_served_200; then
+    log "/local/hbot_pair_nonce.txt already served (200) — static mount live, no reload needed."
+    return 0
+  fi
+  if [[ -z "$SUP_TOKEN" ]]; then
+    log "WARNING: no SUPERVISOR_TOKEN — cannot reload Core to expose /local; relying on :8098 proxy nonce fallback."
+    return 1
+  fi
+  # Step 1: reload_core_config — re-registers the static /local path handler without a restart.
+  log "/local not served yet — POST reload_core_config to register the static /local mount…"
+  curl -fsS -m 30 -X POST \
+    -H "Authorization: Bearer ${SUP_TOKEN}" -H 'Content-Type: application/json' \
+    "http://supervisor/core/api/services/homeassistant/reload_core_config" -d '{}' >/dev/null 2>&1 || \
+    log "reload_core_config request errored (non-fatal) — will verify anyway."
+  # HA needs a beat to re-register the aiohttp static route.
+  local i
+  for i in 1 2 3 4 5 6; do
+    if nonce_served_200; then
+      log "/local/hbot_pair_nonce.txt now served (200) after reload_core_config — 0-tap auto-bind ready."
+      return 0
+    fi
+    sleep 2
+  done
+  # Step 2: guarded full Core restart (at most ONCE per pairing — a /data flag prevents a restart loop).
+  if [[ -f "$RESTART_FLAG" ]]; then
+    log "WARNING: /local still 404 after reload AND a Core restart was already attempted this pairing — not restarting again (loop guard). Falling back to :8098 proxy nonce."
+    return 1
+  fi
+  printf '%s' "$(date -u +%FT%TZ)" > "$RESTART_FLAG" 2>/dev/null || true
+  log "reload_core_config did not expose /local — falling back to a ONE-TIME Core restart to scan www/ at startup…"
+  curl -fsS -m 30 -X POST \
+    -H "Authorization: Bearer ${SUP_TOKEN}" -H 'Content-Type: application/json' \
+    "http://supervisor/core/api/services/homeassistant/restart" -d '{}' >/dev/null 2>&1 || \
+    log "Core restart request errored (non-fatal) — the :8098 proxy nonce fallback still lets the app bind."
+  log "Core restart requested — /local will register on next boot; the app can also read the nonce from the add-on proxy at :8098/hbot_pair_nonce meanwhile."
+  return 0
+}
+ensure_local_mount || true
 
 # ── Tailscale IP (multi-HA tailnet disambiguation) ───────────────────────────────────────────────────
 # On a tailnet with 2+ HAs both named "homeassistant", the bare MagicDNS name resolves to only ONE box,
@@ -208,6 +271,7 @@ while [[ $(date +%s) -lt $DEADLINE ]]; do
       rm -f "$CODE_FILE"
       # Pairing done → retire the LAN nonce (remove the served file + cache) so it can't be reused.
       rm -f "$NONCE_FILE" /homeassistant/www/hbot_pair_nonce.txt /config/www/hbot_pair_nonce.txt 2>/dev/null || true
+  rm -f /data/.local_mount_restarted 2>/dev/null || true  # reset the one-time restart guard so a future re-pair on this box can restart Core again if needed
       log "paired to home ${HID}. Remote access will come up shortly."
       exit 0
     fi
