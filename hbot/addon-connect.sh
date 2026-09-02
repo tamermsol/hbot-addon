@@ -145,9 +145,26 @@ ensure_trusted_proxies() {
   # Only (re)write if missing/different, so we don't churn Core reloads on every boot.
   local want='homeassistant:
   packages: !include_dir_named packages'
-  # Ensure configuration.yaml includes packages (idempotent): if no "packages:" under homeassistant, add it.
-  if ! grep -qE '^\s*packages:\s*!include_dir_named\s+packages' /homeassistant/configuration.yaml 2>/dev/null; then
-    printf '\n# Added by HBot add-on so package files (incl. tunnel trusted_proxies) load.\nhomeassistant:\n  packages: !include_dir_named packages\n' >> /homeassistant/configuration.yaml 2>/dev/null || true
+  # Ensure configuration.yaml loads packages, WITHOUT ever writing a second top-level `homeassistant:`
+  # block (duplicate YAML keys make Core refuse to boot — config-corruption). Three cases:
+  #   (a) a `packages:` include already present anywhere → nothing to do.
+  #   (b) NO top-level `homeassistant:` key at all → safe to append our own block.
+  #   (c) a `homeassistant:` block EXISTS but has no packages include → we must NOT append a second
+  #       block; log clearly and rely on the package file still being read only if the user adds the
+  #       include. (We refuse to blindly splice under an existing block from a shell script — that risks
+  #       corrupting hand-authored YAML. The tunnel simply 400s until the include is added, which the
+  #       log explains, rather than bricking Core.)
+  local cfg="/homeassistant/configuration.yaml"
+  local has_pkg_include has_ha_key
+  has_pkg_include="$(grep -cE '^\s*packages:\s*!include_dir_named\s+packages' "$cfg" 2>/dev/null || echo 0)"
+  has_ha_key="$(grep -cE '^homeassistant:\s*$' "$cfg" 2>/dev/null || echo 0)"
+  if [[ "$has_pkg_include" == "0" ]]; then
+    if [[ "$has_ha_key" == "0" ]]; then
+      printf '\n# Added by HBot add-on so package files (incl. tunnel trusted_proxies) load.\nhomeassistant:\n  packages: !include_dir_named packages\n' >> "$cfg" 2>/dev/null || true
+      echo "[hbot-connect] added 'homeassistant: packages: !include_dir_named packages' to configuration.yaml."
+    else
+      echo "[hbot-connect] warn: configuration.yaml already has a 'homeassistant:' block but no packages include — NOT appending a duplicate key (would break Core). Add 'packages: !include_dir_named packages' under it to enable the tunnel trusted_proxies package."
+    fi
   fi
   # The proxy IP HA sees is the add-on's OWN source IP reaching Core. Because this add-on runs with
   # host_network: true, cloudflared reaches homeassistant:8123 from the HOST's LAN IP (e.g. 192.168.1.x),
@@ -168,13 +185,24 @@ ensure_trusted_proxies() {
     echo "    - 127.0.0.1"
     echo "    - ::1"
   } > "$pkg" 2>/dev/null || true
-  echo "[hbot-connect] wrote trusted_proxies package; reloading Core config…"
-  # Validate + reload via Core service (no full restart needed for http trusted_proxies? http needs a
-  # restart — so request a Core restart, which HA schedules gracefully).
-  curl -fsS -m 10 -X POST -H "Authorization: Bearer ${HA_TOKEN}" \
-    "http://supervisor/core/api/services/homeassistant/restart" -H 'Content-Type: application/json' -d '{}' \
-    >/dev/null 2>&1 && echo "[hbot-connect] Core restart requested to apply trusted_proxies." \
-    || echo "[hbot-connect] warn: Core restart request failed — trusted_proxies will apply on next HA restart."
+  echo "[hbot-connect] wrote trusted_proxies package; validating Core config before restart…"
+  # Validate the config via Core's check_config service BEFORE requesting a restart, so a malformed
+  # configuration.yaml (whatever the cause) never gets a restart that would leave Core down. Uses the
+  # Supervisor proxy path with SUPERVISOR_TOKEN (check_config is a Supervisor operation). If validation
+  # fails or is unavailable, we do NOT restart — trusted_proxies simply applies on the next manual
+  # restart, which is safe (tunnel 400s until then) rather than risking a boot failure.
+  local check_code
+  check_code="$(curl -s -o /dev/null -m 20 -w '%{http_code}' -X POST \
+    -H "Authorization: Bearer ${SUP_TOKEN:-${SUPERVISOR_TOKEN:-${HASSIO_TOKEN:-}}}" \
+    "http://supervisor/core/check" 2>/dev/null || echo 000)"
+  if [[ "$check_code" == "200" ]]; then
+    curl -fsS -m 10 -X POST -H "Authorization: Bearer ${HA_TOKEN}" \
+      "http://supervisor/core/api/services/homeassistant/restart" -H 'Content-Type: application/json' -d '{}' \
+      >/dev/null 2>&1 && echo "[hbot-connect] config valid — Core restart requested to apply trusted_proxies." \
+      || echo "[hbot-connect] warn: Core restart request failed — trusted_proxies will apply on next HA restart."
+  else
+    echo "[hbot-connect] warn: config check returned ${check_code} (not 200) — NOT restarting Core; trusted_proxies will apply on the next manual restart."
+  fi
 }
 ensure_trusted_proxies
 
