@@ -1,5 +1,27 @@
 # HBot Add-on Changelog
 
+## 1.4.26
+- **Fixes the fresh-box "paired but nothing happens / app stays Looking for your HA" dead-end.**
+  Root cause: `addon-connect.sh` had regressed to a stale build that POSTed `/provision` with ONLY
+  `{home_id}` (no HA token) and then tried a Supabase **PATCH** write-back with the anon key. On a
+  brand-new home no `ha_connections` row exists, so the PATCH updated **zero rows** and no token was
+  ever minted — hbot-connect's server-side write refuses a token-less `base_url` (it would look
+  "paired but stuck"), so `ha_connections` stayed EMPTY and the app could never connect (claim binds
+  in ~3s, but the connection row never lands). DB-proven on a fresh home (approved claim, `mint_error`
+  NULL, `ha_connections` empty).
+- **Fix:** `addon-connect.sh` now MINTS a real Home Assistant long-lived access token (LLAT, a JWT)
+  from inside HAOS via `mint_llat.py` (Core WebSocket `auth/long_lived_access_token`), VERIFIES it
+  against Core's DIRECT `/api/` (must return 200 — the exact path the app uses, where a
+  SUPERVISOR_TOKEN would 401), then:
+    - POSTs `/ha-connection {base_url: LAN URL, access_token}` immediately (LAN fast path — the app
+      connects on-network the instant pairing finishes, before Cloudflare), and
+    - POSTs `/provision {home_id, access_token}` so hbot-connect (service key) UPSERTS a complete
+      `ha_connections` row (INSERTs it if absent) with `base_url` = the stable tunnel URL **and** the
+      durable JWT token. No supervisor-token is ever written as the app's token.
+  This restores the same connection path the working homes already use (183-char `eyJ…` JWT).
+
+# HBot Add-on Changelog
+
 ## 1.4.25
 - **Permanent fix for the fresh-box pairing dead-end (registered claim never binds → `ha_connections`
   stays empty → app shows "install the add-on" forever).** Root cause: Home Assistant registers the
