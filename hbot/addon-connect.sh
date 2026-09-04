@@ -207,17 +207,94 @@ ensure_trusted_proxies() {
 ensure_trusted_proxies
 
 echo "[hbot-connect] starting cloudflared → ${URL}"
-# Supervised retry loop: if cloudflared ever exits (network blip, CF edge hiccup, CGNAT re-NAT), the
-# add-on used to stay "started" (the python bridge is the foreground process) while the tunnel stayed
-# DEAD — the app then saw Cloudflare 530/1033 with no self-healing. Wrap it so a drop reconnects
-# automatically with capped backoff. --retries and --grace-period make cloudflared itself hold on
-# harder before giving up a connection; the outer loop covers a full process exit.
-backoff=2
+# ── SUPERVISED TUNNEL (permanent self-heal — RESTORED into v1.4.26, 2026-09-04) ─────────────────────
+# REGRESSION FIXED: the v1.4.26 reconcile (mint-LLAT + LAN fast-path) replaced the self-heal watchdog
+# with a bare `while true; cloudflared … run` loop that ONLY restarts on PROCESS EXIT. When cloudflared
+# de-registers its origin (network blip, CGNAT re-NAT, CF edge hiccup) the LOCAL PROCESS STAYS ALIVE
+# while the public tunnel is DEAD — Cloudflare's edge serves HTTP 530 / "error code: 1033" and nothing
+# respawns it, so every HA tile goes Offline until someone manually restarts the add-on. This has now
+# recurred 6×. Restarting only on PROCESS EXIT is NOT enough: the process does not exit in this failure.
+# The ONLY authoritative signal is an END-TO-END probe of the PUBLIC endpoint. So: run cloudflared in the
+# background, probe ${URL}/api/ every 30s, and on 2 CONSECUTIVE public failures force-kill (-9) cloudflared
+# and relaunch it. Loop forever while paired.  POSIX/bash, Alpine-safe: only kill, sleep, curl, date, builtins.
+
+TS() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+
+# Log the heartbeat back to hbot-connect on each probe state change (best-effort, non-fatal). This gives
+# OFF-BOX observability that does NOT depend on this dying add-on process (backend GET /tunnel-health).
+heartbeat() {
+  # $1 = "ok" / "fail"
+  [ -n "${HBOT_CONNECT_URL:-}" ] || return 0
+  curl -fsS -m 8 -X POST "${HBOT_CONNECT_URL}/tunnel-health" \
+    -H 'Content-Type: application/json' \
+    -H "X-Hbot-Provision-Token: ${PROV_TOKEN}" \
+    --data "{\"home_id\":\"${HOME_ID}\",\"status\":\"${1}\",\"url\":\"${URL}\"}" \
+    >/dev/null 2>&1 || true
+}
+
+start_cloudflared() {
+  # --retries/--grace-period make cloudflared hold onto a connection harder before giving up; the outer
+  # public-probe watchdog covers the case where it silently keeps a dead origin.
+  cloudflared tunnel --no-autoupdate --retries 10 --grace-period 30s run --token "$TUNNEL_TOKEN" &
+  CF_PID=$!
+  echo "[hbot-connect] $(TS) cloudflared started pid=${CF_PID} → ${URL}"
+}
+
+# Probe the PUBLIC endpoint end-to-end. Returns 0 = healthy, 1 = failure.
+# Healthy = any HTTP status that proves a live origin answered (200/401/403 — an HA auth challenge still
+# means cloudflared delivered the request to Core). Failure = 530/502/000/timeout, OR a body containing
+# "error code: 1033" (Cloudflare's no-origin page). We inspect the BODY, not only the code, because 1033
+# is the definitive dead-origin tell.
+probe_public() {
+  _body="$(curl -s -m 12 "${URL}/api/" 2>/dev/null)"
+  _code="$(curl -s -o /dev/null -m 12 -w '%{http_code}' "${URL}/api/" 2>/dev/null || echo 000)"
+  case "$_body" in
+    *"error code: 1033"*) return 1 ;;   # Cloudflare "no origin" — definitive tunnel death
+  esac
+  case "$_code" in
+    200|401|403) return 0 ;;             # a live origin answered (auth-gated is fine)
+    *) return 1 ;;                       # 530/502/000/timeout/etc = origin not reachable via edge
+  esac
+}
+
+start_cloudflared
+fails=0
+last_reported=""   # "ok" / "fail" — heartbeat ONLY on state change (keeps backend traffic tiny fleet-wide)
+# Give cloudflared a moment to register its first connection before the first public probe.
+sleep 20
 while true; do
-  cloudflared tunnel --no-autoupdate --retries 10 --grace-period 30s run --token "$TUNNEL_TOKEN"
-  rc=$?
-  echo "[hbot-connect] cloudflared exited rc=$rc — reconnecting in ${backoff}s (tunnel auto-heal)."
-  sleep "$backoff"
-  # exponential backoff capped at 60s so a persistent outage doesn't hammer the CF edge.
-  backoff=$(( backoff * 2 )); [ "$backoff" -gt 60 ] && backoff=60
+  if probe_public; then
+    if [ "$fails" -ne 0 ]; then echo "[hbot-connect] $(TS) public probe recovered (${URL}/api/ healthy)."; fi
+    fails=0
+    if [ "$last_reported" != "ok" ]; then heartbeat "ok"; last_reported="ok"; fi
+  else
+    fails=$(( fails + 1 ))
+    echo "[hbot-connect] $(TS) public probe FAILED (${URL}/api/ → code=${_code}, 1033-body=$(case "$_body" in *'error code: 1033'*) echo yes;; *) echo no;; esac)) — consecutive=${fails}."
+    if [ "$last_reported" != "fail" ]; then heartbeat "fail"; last_reported="fail"; fi
+    if [ "$fails" -ge 2 ]; then
+      # Do NOT trust the local PID being alive — the process stays 'up' while the origin is de-registered.
+      # Only the public probe is authoritative, so on 2 consecutive public failures we force-kill + relaunch.
+      echo "[hbot-connect] $(TS) 2 consecutive public failures — force-killing cloudflared pid=${CF_PID} and relaunching (tunnel auto-heal)."
+      kill -9 "$CF_PID" 2>/dev/null || true
+      wait "$CF_PID" 2>/dev/null || true
+      # If cloudflared already died on its own, reap any stragglers too.
+      pkill -9 -f 'cloudflared tunnel' 2>/dev/null || true
+      sleep 2
+      start_cloudflared
+      fails=0
+      sleep 20   # let the fresh process register before probing again
+      continue
+    fi
+  fi
+  # If cloudflared exited entirely (not just origin-dead), relaunch immediately regardless of probe count.
+  if ! kill -0 "$CF_PID" 2>/dev/null; then
+    echo "[hbot-connect] $(TS) cloudflared process exited — relaunching."
+    pkill -9 -f 'cloudflared tunnel' 2>/dev/null || true
+    sleep 1
+    start_cloudflared
+    fails=0
+    sleep 20
+    continue
+  fi
+  sleep 30
 done
